@@ -994,9 +994,8 @@ class ResourceManagerV1(ResourceManager):
                                         f"even after preemption attempt. Request will wait for more resources."
                                     )
                                     # Do NOT schedule this request - it will wait in the queue
-                                    # But still consume token_budget to avoid infinite loop
+                                    # NOTE: Do NOT consume token_budget either, decode only needs memory allocation
                                     req_index += 1
-                                    token_budget -= 1
                                     continue
 
                                 # Allocation for next decoding blocks after preemption
@@ -1009,12 +1008,14 @@ class ResourceManagerV1(ResourceManager):
                                 scheduled_reqs.append(self._prepare_decode_task(request))
 
                     # No new blocks needed (num_new_blocks_needed == 0), but still schedule decode task
-                    # SGLang-aligned: always schedule decode for each iteration
+                    # SGLang-aligned: decode does NOT consume token_budget, only checks memory
                     else:
                         scheduled_reqs.append(self._prepare_decode_task(request))
 
+                    # NOTE: Decode no longer consumes token_budget here
+                    # SGLang-aligned: token_budget is only used for prefill requests
+                    # Decode only needs block allocation, not token budget
                     num_decoding_req_nums += 1
-                    token_budget -= 1
                     if (
                         request.use_extend_tables
                         and request.request_id not in self.using_extend_tables_req_id
@@ -1113,7 +1114,16 @@ class ResourceManagerV1(ResourceManager):
                 req_index += 1
 
             # Second, schedule the WAITING requests.
+            # SGLang-aligned: When adding prefill requests, account for decode requests
+            # This mimics: rem_input_tokens = max_prefill_tokens - mixed_with_decode_tokens
             if not preempted_reqs:
+                # Calculate how many decode requests are running (mixed_with_decode_tokens)
+                num_decode_requests = sum(
+                    1 for r in self.running if r.num_computed_tokens >= r.need_prefill_tokens
+                )
+                # Subtract decode count from token_budget (SGLang's mixed_with_decode_tokens)
+                token_budget = max(0, token_budget - num_decode_requests)
+
                 skip_requests: list[Request] = []
                 while self.waiting and token_budget > 0:
                     if len(self.running) == self.max_num_seqs:
