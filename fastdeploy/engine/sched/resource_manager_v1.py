@@ -226,10 +226,6 @@ class ResourceManagerV1(ResourceManager):
         # Tracks whether the last scheduled forward had decode requests.
         # Used in notify_forward_complete() to guard ratio decay (SGLang-aligned).
         self._last_forward_has_decode: bool = False
-        # Tracks whether new prefill requests from waiting queue were admitted in the last forward.
-        # Used to align decay timing with SGLang: decay only on decode-only forwards
-        # (SGLang's update_running_batch is only called when get_new_batch_prefill returns None).
-        self._last_forward_had_new_prefill: bool = False
 
         llm_logger.info(
             f"NewTokenRatio initialized: init={self.init_new_token_ratio:.3f}, "
@@ -531,18 +527,22 @@ class ResourceManagerV1(ResourceManager):
         """
         Calculate total reserved tokens for all running decode requests based on current_new_token_ratio.
 
-        For each request in decode phase, calculate:
+        SGLang-aligned: only count requests in decode phase (num_computed_tokens >= need_prefill_tokens),
+        mirroring SGLang's running_batch which contains only decode-phase requests.
+
+        For each decode request:
             remaining_tokens = min(max_new_tokens - already_decoded, clip_estimation)
             reserved_tokens = remaining_tokens * current_new_token_ratio
 
         Returns:
-            int: Total number of tokens to reserve for decode requests
+            float: Total number of tokens to reserve for running decode requests
         """
         total_reserved_tokens = 0
         num_decode_reqs = 0
 
         for req in self.running:
             # Only calculate reservation for requests in decode phase
+            # (SGLang-aligned: running_batch contains only decode-phase requests)
             if req.num_computed_tokens < req.need_prefill_tokens:
                 continue  # Still in prefill, skip
 
@@ -602,7 +602,7 @@ class ResourceManagerV1(ResourceManager):
 
         # 2. SGLang-aligned: Only reserve max_new_tokens for the LAST chunk
         remaining_tokens_to_prefill = request.need_prefill_tokens - request.num_computed_tokens
-        is_last_chunk = remaining_tokens_to_prefill <= num_chunk_new_block
+        is_last_chunk = remaining_tokens_to_prefill <= num_chunk_new_block * self.config.cache_config.block_size
 
         max_new_tokens_for_request = 0
         if is_last_chunk:
@@ -1196,12 +1196,11 @@ class ResourceManagerV1(ResourceManager):
             # - This cycle's new decode requests: Only those that will be created from waiting queue
             # SGLang non-mixed: waiting queue is only processed in EXTEND mode
             if not preempted_reqs and is_extend_mode:
-                # SGLang-aligned: track exact reserved tokens for last-chunk requests scheduled
-                # this cycle.  For each last-chunk req: min(max_new_tokens - len(output_ids), CLIP) * ratio
-                # (output_ids is empty at scheduling time, so this simplifies to min(max_new_tokens, CLIP) * ratio)
+                # SGLang-aligned: track reserved tokens for last-chunk requests scheduled this cycle.
+                # SGLang _update_prefill_budget: rem_total_token_offset += extend_input_len + max_new_tokens
+                # For new requests, max_new_tokens is NOT multiplied by ratio (unlike running decode requests).
+                # This mirrors SGLang's _update_prefill_budget where new req decode reservation = min(max_new_tokens, CLIP).
                 scheduled_new_decode_reserved_tokens: float = 0.0
-                # Track whether any new prefill was admitted from waiting queue (for decay timing fix 3)
-                admitted_new_prefill_this_cycle: bool = False
 
                 skip_requests: list[Request] = []
                 while self.waiting and token_budget > 0:
@@ -1277,7 +1276,6 @@ class ResourceManagerV1(ResourceManager):
                         self.waiting.popleft()
                         self.running.append(request)
                         scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
-                        admitted_new_prefill_this_cycle = True
 
                         # If this is the last chunk, accumulate exact decode reservation:
                         # SGLang: min(max_new_tokens - len(output_ids), CLIP) * ratio
@@ -1358,7 +1356,6 @@ class ResourceManagerV1(ResourceManager):
                         self.waiting.popleft()
                         self.running.append(request)
                         scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
-                        admitted_new_prefill_this_cycle = True
 
                         # If this is the last chunk, accumulate exact decode reservation:
                         # SGLang: min(max_new_tokens - len(output_ids), CLIP) * ratio
@@ -1452,16 +1449,6 @@ class ResourceManagerV1(ResourceManager):
                 getattr(r, "task_type", None) == RequestType.DECODE
                 for r in scheduled_reqs
             )
-            # Track whether new prefill was admitted from waiting queue this forward.
-            # SGLang: update_running_batch (and thus decay) is only called when
-            # get_new_batch_prefill() returns None (no new prefill). So decay should
-            # only happen when there is NO new prefill admitted this cycle.
-            self._last_forward_had_new_prefill = (
-                admitted_new_prefill_this_cycle
-                if (not preempted_reqs and is_extend_mode)
-                else False
-            )
-
             # Save token_budget for next schedule() call within the same forward cycle
             self.token_budget = token_budget
 
@@ -1481,12 +1468,9 @@ class ResourceManagerV1(ResourceManager):
             # Reset token_budget for next forward cycle
             self.token_budget = self.config.scheduler_config.max_num_batched_tokens
 
-            # SGLang-aligned: only decay when the last forward actually had decode requests
-            # AND no new prefill was admitted from waiting queue.
-            # In SGLang, decay happens in update_running_batch() which is only called for
-            # DECODE batches (get_new_batch_prefill() returned None). If new prefill was
-            # admitted (EXTEND batch), decay does NOT happen that step.
-            if self._last_forward_has_decode and not self._last_forward_had_new_prefill:
+            # SGLang-aligned: only decay when the last forward actually had decode requests.
+            # FD is always mixed (prefill+decode together), so decay whenever decode is present.
+            if self._last_forward_has_decode:
                 has_decode_requests = any(
                     req.num_computed_tokens >= req.need_prefill_tokens
                     for req in self.running
