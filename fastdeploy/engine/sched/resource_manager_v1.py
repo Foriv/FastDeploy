@@ -223,8 +223,13 @@ class ResourceManagerV1(ResourceManager):
         # Token budget persists across multiple schedule() calls within a single forward cycle
         self.token_budget: int = 0
         self.schedule_cycle_in_progress: bool = False
-        # Tracks whether the last forward was a DECODE forward (for ratio decay in notify_forward_complete)
-        self._last_forward_is_decode: bool = False
+        # Tracks whether the last scheduled forward had decode requests.
+        # Used in notify_forward_complete() to guard ratio decay (SGLang-aligned).
+        self._last_forward_has_decode: bool = False
+        # Tracks whether new prefill requests from waiting queue were admitted in the last forward.
+        # Used to align decay timing with SGLang: decay only on decode-only forwards
+        # (SGLang's update_running_batch is only called when get_new_batch_prefill returns None).
+        self._last_forward_had_new_prefill: bool = False
 
         llm_logger.info(
             f"NewTokenRatio initialized: init={self.init_new_token_ratio:.3f}, "
@@ -568,7 +573,7 @@ class ResourceManagerV1(ResourceManager):
 
         return total_reserved_tokens
 
-    def _get_can_schedule_prefill_threshold_block(self, request, num_chunk_new_block, scheduled_decode_count=0):
+    def _get_can_schedule_prefill_threshold_block(self, request, num_chunk_new_block, new_decode_reserved_tokens: float = 0.0):
         """
         Calculate the total tokens needed for scheduling a new prefill request.
 
@@ -580,42 +585,39 @@ class ResourceManagerV1(ResourceManager):
         1. Tokens needed for current prefill chunk (current chunk's token count, NOT full input)
         2. Tokens reserved for this request's future decode (max_new_tokens only for last chunk)
         3. Tokens reserved for ALL running decode requests (from previous cycles)
-        4. Tokens reserved for NEW decode requests in this cycle
+        4. Tokens reserved for NEW decode requests in this cycle (pre-computed by caller, SGLang-aligned)
 
         Args:
             request: The new prefill request being scheduled
             num_chunk_new_block: Number of blocks for current chunk
-            scheduled_decode_count: Number of NEW decode requests in this cycle (default 0)
+            new_decode_reserved_tokens: Pre-computed reserved tokens for last-chunk requests
+                already scheduled in this cycle. Caller computes:
+                sum of min(max_new_tokens - len(output_ids), CLIP) * ratio for each last-chunk req.
 
         Returns:
             int: Total blocks needed (ceiled once at the end) to safely admit this request
         """
         # 1. SGLang-aligned: Use current chunk's token count, not the full prefill
-        # This is the key difference - only reserve for what we're actually processing NOW
-        # num_chunk_new_block is the block count for current chunk, multiplied by block_size gives token count
         required_tokens_for_prefill = num_chunk_new_block * self.config.cache_config.block_size
 
         # 2. SGLang-aligned: Only reserve max_new_tokens for the LAST chunk
-        # Calculate remaining tokens to prefill after this chunk
         remaining_tokens_to_prefill = request.need_prefill_tokens - request.num_computed_tokens
         is_last_chunk = remaining_tokens_to_prefill <= num_chunk_new_block
 
         max_new_tokens_for_request = 0
         if is_last_chunk:
-            # This is the last chunk - reserve full max_new_tokens (SGLang behavior)
             if hasattr(request, 'sampling_params') and request.sampling_params and request.sampling_params.max_tokens:
                 max_new_tokens_for_request = request.sampling_params.max_tokens
             else:
                 max_new_tokens_for_request = self.config.model_config.max_model_len - request.need_prefill_tokens
             max_new_tokens_for_request = min(max_new_tokens_for_request, self.clip_max_new_tokens_estimation)
 
-        # 3. Tokens reserved for ALL running decode requests (SGLang-aligned)
-        # This is the key difference from previous implementation - we now include ALL running decode requests
+        # 3. Tokens reserved for ALL running decode requests (SGLang: running_batch.reqs)
         running_decode_reserved_tokens = self._calculate_decode_reserved_tokens_by_ratio()
 
-        # 4. Tokens reserved for NEW decode requests in this cycle only
-        new_decode_reserved_tokens = self._calculate_decode_reserved_tokens_for_new_requests(
-            scheduled_decode_count
+        # 4. Tokens reserved for NEW decode requests in this cycle (SGLang: add_req_state accumulation)
+        cycle_new_decode_reserved = self._calculate_decode_reserved_tokens_for_new_requests(
+            new_decode_reserved_tokens
         )
 
         # Sum all tokens and convert to blocks once at the end
@@ -623,7 +625,7 @@ class ResourceManagerV1(ResourceManager):
             required_tokens_for_prefill
             + max_new_tokens_for_request
             + running_decode_reserved_tokens
-            + new_decode_reserved_tokens
+            + cycle_new_decode_reserved
         )
         can_schedule_block_num_threshold = (
             total_tokens + self.config.cache_config.block_size - 1
@@ -638,48 +640,26 @@ class ResourceManagerV1(ResourceManager):
             f"Prefill threshold (SGLang-aligned): tokens={total_tokens:.1f} -> blocks={can_schedule_block_num_threshold} "
             f"(prefill={required_tokens_for_prefill}, future_decode={max_new_tokens_for_request:.1f}, "
             f"running_decode_reserved={running_decode_reserved_tokens:.1f}, "
-            f"new_decode_reserved={new_decode_reserved_tokens:.1f}, is_last_chunk={is_last_chunk}, "
-            f"scheduled_decode_count={scheduled_decode_count})"
+            f"new_decode_reserved={cycle_new_decode_reserved:.1f}, is_last_chunk={is_last_chunk})"
         )
 
         return can_schedule_block_num_threshold
 
-    def _calculate_decode_reserved_tokens_for_new_requests(self, scheduled_decode_count):
+    def _calculate_decode_reserved_tokens_for_new_requests(self, new_decode_reserved_tokens: float):
         """
-        Calculate reserved tokens for NEW decode requests in this cycle only.
+        Return pre-computed reserved tokens for NEW decode requests in this cycle.
 
-        This is different from _calculate_decode_reserved_tokens_by_ratio which considers
-        all running decode requests. Here we only consider the NEW decode requests
-        that will be added in this schedule cycle.
+        SGLang-aligned: callers compute min(max_new_tokens - len(output_ids), CLIP) * ratio
+        for each last-chunk request at scheduling time, and pass the running total here.
 
         Args:
-            scheduled_decode_count: Number of new decode requests to be scheduled this cycle
+            new_decode_reserved_tokens: Exact reserved tokens already accumulated by the caller
+                for all last-chunk requests scheduled so far in this cycle.
 
         Returns:
-            int: Total number of tokens to reserve for new decode requests
+            float: The same value passed in (kept for symmetry with other _calculate helpers)
         """
-        if scheduled_decode_count == 0:
-            return 0
-
-        # For new decode requests, we use a simplified estimation:
-        # Each new decode request reserves some initial tokens based on current_new_token_ratio
-        # This is an approximation - we don't know exactly how many tokens each will generate
-        # So we use a conservative estimate based on the ratio
-
-        # Use the current new_token_ratio as a multiplier for estimation
-        # This reserves a portion of max_model_len for each new decode request
-        avg_reserved_per_decode = (
-            self.config.model_config.max_model_len * self.current_new_token_ratio * 0.1  # Conservative estimate
-        )
-
-        total_reserved_tokens = scheduled_decode_count * avg_reserved_per_decode
-
-        llm_logger.debug(
-            f"New decode reservation: {scheduled_decode_count} new decodes, "
-            f"{total_reserved_tokens:.1f} tokens reserved (ratio={self.current_new_token_ratio:.3f})"
-        )
-
-        return total_reserved_tokens
+        return new_decode_reserved_tokens
 
     def _update_mm_hashes(self, request):
         if request.multimodal_inputs is None:
@@ -987,7 +967,13 @@ class ResourceManagerV1(ResourceManager):
             # SGLang-aligned: token_budget persists across schedule() calls within a forward cycle
             # If no cycle in progress, initialize token_budget; otherwise use the remaining budget
             if not self.schedule_cycle_in_progress:
-                token_budget = self.config.scheduler_config.max_num_batched_tokens
+                # SGLang mixed_chunk: subtract running_bs (one token per decode req) from budget
+                # mirrors: rem_input_tokens = max_prefill_tokens - mixed_with_decode_tokens
+                running_decode_count = sum(
+                    1 for r in self.running
+                    if r.num_computed_tokens >= r.need_prefill_tokens
+                )
+                token_budget = self.config.scheduler_config.max_num_batched_tokens - running_decode_count
                 self.schedule_cycle_in_progress = True
             else:
                 token_budget = self.token_budget  # Use remaining budget from previous schedule() call
@@ -1023,11 +1009,6 @@ class ResourceManagerV1(ResourceManager):
                 # The need_block_num signal is only for handling worker-side block requests,
                 # but decode scheduling should always happen regardless of this signal
                 if request.num_computed_tokens >= request.need_prefill_tokens:  # to be decoding
-                    if is_extend_mode:
-                        # SGLang non-mixed: skip decode scheduling during EXTEND (prefill) batch.
-                        # These requests will be decoded in the next DECODE batch after prefill completes.
-                        req_index += 1
-                        continue
                     if (
                         self.config.scheduler_config.splitwise_role == "prefill"
                     ):  # do not need to schedule for decoding
@@ -1175,10 +1156,11 @@ class ResourceManagerV1(ResourceManager):
                     if get_enough_request(request, scheduled_reqs):
                         req_index += 1
                         continue
-                    # Running prefill: use chunked_prefill_size as budget limit (not affected by token_budget)
-                    # This ensures running prefill requests are not limited by the batch token budget
-                    # which is only for waiting queue prefill requests
-                    num_new_tokens = self._get_num_new_tokens(request, chunked_prefill_size, chunked_prefill_size)
+                    # SGLang-aligned: running chunked prefill consumes BOTH rem_chunk_tokens and
+                    # rem_input_tokens (token_budget). In add_chunked_req, _update_prefill_budget
+                    # is called which deducts extend_input_len from both budgets.
+                    # Here: min(chunked_prefill_size, token_budget) mirrors min(rem_chunk_tokens, rem_total_tokens)
+                    num_new_tokens = self._get_num_new_tokens(request, chunked_prefill_size, token_budget)
                     num_new_block = self.get_new_block_nums(request, num_new_tokens)
                     # Allocate blocks to prefill
                     if self.cache_manager.can_allocate_gpu_blocks(num_new_block):
@@ -1199,9 +1181,8 @@ class ResourceManagerV1(ResourceManager):
                         )
                         # Prepare prefill task
                         scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
-                    # NOTE: Running prefill does NOT consume token_budget (SGLang-aligned)
-                    # Token budget is only used for prefill requests from waiting queue
-                    # Running prefill requests were already scheduled in previous cycles
+                    # SGLang-aligned: running chunked prefill also consumes token_budget
+                    token_budget -= num_new_tokens
                     request.num_computed_tokens += num_new_tokens
                     if self.config.cache_config.enable_prefix_caching:
                         self.cache_manager.update_cache_blocks(
@@ -1215,9 +1196,12 @@ class ResourceManagerV1(ResourceManager):
             # - This cycle's new decode requests: Only those that will be created from waiting queue
             # SGLang non-mixed: waiting queue is only processed in EXTEND mode
             if not preempted_reqs and is_extend_mode:
-                # Track how many decode requests will be created in this cycle from waiting queue
-                # This is used for prefill threshold calculation
-                scheduled_decode_count_this_cycle = 0
+                # SGLang-aligned: track exact reserved tokens for last-chunk requests scheduled
+                # this cycle.  For each last-chunk req: min(max_new_tokens - len(output_ids), CLIP) * ratio
+                # (output_ids is empty at scheduling time, so this simplifies to min(max_new_tokens, CLIP) * ratio)
+                scheduled_new_decode_reserved_tokens: float = 0.0
+                # Track whether any new prefill was admitted from waiting queue (for decay timing fix 3)
+                admitted_new_prefill_this_cycle: bool = False
 
                 skip_requests: list[Request] = []
                 while self.waiting and token_budget > 0:
@@ -1271,48 +1255,60 @@ class ResourceManagerV1(ResourceManager):
                         remaining_tokens_to_prefill = request.need_prefill_tokens - request.num_computed_tokens
                         is_last_chunk = remaining_tokens_to_prefill <= num_new_tokens
 
-                        # Calculate threshold with NEW decode count for this cycle only
+                        # SGLang-aligned: always check rem_total_tokens equivalent (includes running
+                        # decode reservation) for ALL requests, including the first.
+                        # SGLang's add_one_req: `if total_tokens >= rem_total_tokens: return NO_TOKEN`
+                        # always applies. Only the rem_input_tokens (token_budget) check is skipped
+                        # for the first request (handled by `while token_budget > 0` loop condition).
                         can_schedule_block_num_threshold = self._get_can_schedule_prefill_threshold_block(
-                            request, num_new_block, scheduled_decode_count_this_cycle
+                            request, num_new_block, scheduled_new_decode_reserved_tokens
                         )
-                        # Allocate blocks to prefill
-                        if self.cache_manager.can_allocate_gpu_blocks(can_schedule_block_num_threshold):
-                            if not request.get("skip_allocate", False):
-                                extra_gpu_block_ids = self.cache_manager.allocate_gpu_blocks(
-                                    num_new_block, request.request_id
-                                )
-                                request.block_tables.extend(extra_gpu_block_ids)
-                            self.waiting.popleft()
-                            self.running.append(request)
-                            scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
-
-                            # If this is the last chunk, this request will become decode
-                            # Count it for subsequent prefill threshold calculations in this cycle
-                            if is_last_chunk:
-                                scheduled_decode_count_this_cycle += 1
-                                llm_logger.debug(
-                                    f"Request {request.request_id} is last chunk, "
-                                    f"will become decode. scheduled_decode_count_this_cycle={scheduled_decode_count_this_cycle}"
-                                )
-
-                            token_budget -= num_new_tokens
-                            request.num_computed_tokens += num_new_tokens
-                            if self.config.cache_config.enable_prefix_caching:
-                                self.cache_manager.update_cache_blocks(
-                                    request, self.config.cache_config.block_size, request.num_computed_tokens
-                                )
-                            request.status = RequestStatus.RUNNING
-                            if self.config.scheduler_config.splitwise_role == "mixed":
-                                allocated_position = self.get_available_position()
-                                request.idx = allocated_position
-                                self.tasks_list[allocated_position] = request
-                                self.stop_flags[allocated_position] = False
-                                self.req_dict[request.request_id] = allocated_position
-                                llm_logger.debug(f"req_id:{request.request_id} allocate pos end")
-                        else:
+                        if not self.cache_manager.can_allocate_gpu_blocks(can_schedule_block_num_threshold):
                             if self.config.cache_config.enable_prefix_caching:
                                 self._free_blocks(request)
                             break
+
+                        # Allocate blocks to prefill
+                        if not request.get("skip_allocate", False):
+                            extra_gpu_block_ids = self.cache_manager.allocate_gpu_blocks(
+                                num_new_block, request.request_id
+                            )
+                            request.block_tables.extend(extra_gpu_block_ids)
+                        self.waiting.popleft()
+                        self.running.append(request)
+                        scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
+                        admitted_new_prefill_this_cycle = True
+
+                        # If this is the last chunk, accumulate exact decode reservation:
+                        # SGLang: min(max_new_tokens - len(output_ids), CLIP) * ratio
+                        # output_ids is empty at scheduling time, so: min(max_new_tokens, CLIP) * ratio
+                        if is_last_chunk:
+                            if request.sampling_params and request.sampling_params.max_tokens:
+                                _max_new_tok = request.sampling_params.max_tokens
+                            else:
+                                _max_new_tok = self.config.model_config.max_model_len - request.need_prefill_tokens
+                            _max_new_tok = min(_max_new_tok, self.clip_max_new_tokens_estimation)
+                            scheduled_new_decode_reserved_tokens += _max_new_tok
+                            llm_logger.debug(
+                                f"Request {request.request_id} is last chunk, "
+                                f"reserved {_max_new_tok:.1f} tokens. "
+                                f"total new_decode_reserved={scheduled_new_decode_reserved_tokens:.1f}"
+                            )
+
+                        token_budget -= num_new_tokens
+                        request.num_computed_tokens += num_new_tokens
+                        if self.config.cache_config.enable_prefix_caching:
+                            self.cache_manager.update_cache_blocks(
+                                request, self.config.cache_config.block_size, request.num_computed_tokens
+                            )
+                        request.status = RequestStatus.RUNNING
+                        if self.config.scheduler_config.splitwise_role == "mixed":
+                            allocated_position = self.get_available_position()
+                            request.idx = allocated_position
+                            self.tasks_list[allocated_position] = request
+                            self.stop_flags[allocated_position] = False
+                            self.req_dict[request.request_id] = allocated_position
+                            llm_logger.debug(f"req_id:{request.request_id} allocate pos end")
                     elif request.status == RequestStatus.PREEMPTED:
                         request.need_prefill_tokens = (
                             request.num_total_tokens
@@ -1340,37 +1336,48 @@ class ResourceManagerV1(ResourceManager):
                         remaining_tokens_to_prefill = request.need_prefill_tokens - request.num_computed_tokens
                         is_last_chunk = remaining_tokens_to_prefill <= num_new_tokens
 
-                        # Calculate threshold with NEW decode count for this cycle only
+                        # SGLang-aligned: always check rem_total_tokens equivalent (includes running
+                        # decode reservation) for ALL requests, including the first.
+                        # SGLang's add_one_req: `if total_tokens >= rem_total_tokens: return NO_TOKEN`
+                        # always applies. Only the rem_input_tokens (token_budget) check is skipped
+                        # for the first request (handled by `while token_budget > 0` loop condition).
                         can_schedule_block_num_threshold = self._get_can_schedule_prefill_threshold_block(
-                            request, num_new_block, scheduled_decode_count_this_cycle
+                            request, num_new_block, scheduled_new_decode_reserved_tokens
                         )
-                        # Allocate blocks to prefill
-                        if self.cache_manager.can_allocate_gpu_blocks(can_schedule_block_num_threshold):
-                            if not request.get("skip_allocate", False):
-                                extra_gpu_block_ids = self.cache_manager.allocate_gpu_blocks(
-                                    num_new_block, request.request_id
-                                )
-                                request.block_tables.extend(extra_gpu_block_ids)
-                            self.waiting.popleft()
-                            self.running.append(request)
-                            scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
-
-                            # If this is the last chunk, this request will become decode
-                            # Count it for subsequent prefill threshold calculations in this cycle
-                            if is_last_chunk:
-                                scheduled_decode_count_this_cycle += 1
-
-                            token_budget -= num_new_tokens
-                            request.num_computed_tokens += num_new_tokens
-                            if self.config.cache_config.enable_prefix_caching:
-                                self.cache_manager.update_cache_blocks(
-                                    request, self.config.cache_config.block_size, request.num_computed_tokens
-                                )
-                            request.status = RequestStatus.RUNNING
-                        else:
+                        if not self.cache_manager.can_allocate_gpu_blocks(can_schedule_block_num_threshold):
                             if self.config.cache_config.enable_prefix_caching:
                                 self._free_blocks(request)
                             break
+
+                        # Allocate blocks to prefill
+                        if not request.get("skip_allocate", False):
+                            extra_gpu_block_ids = self.cache_manager.allocate_gpu_blocks(
+                                num_new_block, request.request_id
+                            )
+                            request.block_tables.extend(extra_gpu_block_ids)
+                        self.waiting.popleft()
+                        self.running.append(request)
+                        scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
+                        admitted_new_prefill_this_cycle = True
+
+                        # If this is the last chunk, accumulate exact decode reservation:
+                        # SGLang: min(max_new_tokens - len(output_ids), CLIP) * ratio
+                        # output_ids is empty at scheduling time, so: min(max_new_tokens, CLIP) * ratio
+                        if is_last_chunk:
+                            if request.sampling_params and request.sampling_params.max_tokens:
+                                _max_new_tok = request.sampling_params.max_tokens
+                            else:
+                                _max_new_tok = self.config.model_config.max_model_len - request.need_prefill_tokens
+                            _max_new_tok = min(_max_new_tok, self.clip_max_new_tokens_estimation)
+                            scheduled_new_decode_reserved_tokens += _max_new_tok
+
+                        token_budget -= num_new_tokens
+                        request.num_computed_tokens += num_new_tokens
+                        if self.config.cache_config.enable_prefix_caching:
+                            self.cache_manager.update_cache_blocks(
+                                request, self.config.cache_config.block_size, request.num_computed_tokens
+                            )
+                        request.status = RequestStatus.RUNNING
                     else:
                         llm_logger.info(f"Unknown request status type:{request.status}, req_id:{request.request_id}")
 
@@ -1437,8 +1444,23 @@ class ResourceManagerV1(ResourceManager):
             # if not scheduled_reqs:
             #     self.reset_new_token_ratio_on_idle()
 
-            # Record batch type so notify_forward_complete() can decay ratio correctly
-            self._last_forward_is_decode = not is_extend_mode
+            # Record whether this forward had decode requests scheduled,
+            # so notify_forward_complete() can decay ratio correctly.
+            # SGLang: decay only happens before DECODE forwards (update_running_batch),
+            # not before EXTEND (prefill) forwards.
+            self._last_forward_has_decode = any(
+                getattr(r, "task_type", None) == RequestType.DECODE
+                for r in scheduled_reqs
+            )
+            # Track whether new prefill was admitted from waiting queue this forward.
+            # SGLang: update_running_batch (and thus decay) is only called when
+            # get_new_batch_prefill() returns None (no new prefill). So decay should
+            # only happen when there is NO new prefill admitted this cycle.
+            self._last_forward_had_new_prefill = (
+                admitted_new_prefill_this_cycle
+                if (not preempted_reqs and is_extend_mode)
+                else False
+            )
 
             # Save token_budget for next schedule() call within the same forward cycle
             self.token_budget = token_budget
@@ -1449,17 +1471,8 @@ class ResourceManagerV1(ResourceManager):
 
     def notify_forward_complete(self):
         """
-        SGLang-aligned: Called when a forward pass is complete.
-        This marks the end of a schedule cycle and resets state for the next cycle.
-
-        Key behaviors:
-        1. Reset token_budget for next forward cycle
-        2. Decay new_token_ratio only after DECODE forwards (not EXTEND/prefill forwards)
-        3. Reset new_token_ratio if system is completely idle (like SGLang's self_check_during_idle)
-
-        Batch type mapping to SGLang:
-          EXTEND forward (_last_forward_is_decode=False): no ratio decay
-          DECODE forward (_last_forward_is_decode=True):  decay ratio
+        Called when a forward pass is complete.
+        Resets schedule cycle state and decays new_token_ratio if decode requests are running.
         """
         with self.lock:
             # End of schedule cycle
@@ -1468,10 +1481,12 @@ class ResourceManagerV1(ResourceManager):
             # Reset token_budget for next forward cycle
             self.token_budget = self.config.scheduler_config.max_num_batched_tokens
 
-            # SGLang non-mixed: only decay new_token_ratio after DECODE forwards.
-            # After an EXTEND (prefill) forward, decode requests are still in self.running
-            # but were NOT scheduled — checking self.running here would incorrectly decay.
-            if self._last_forward_is_decode:
+            # SGLang-aligned: only decay when the last forward actually had decode requests
+            # AND no new prefill was admitted from waiting queue.
+            # In SGLang, decay happens in update_running_batch() which is only called for
+            # DECODE batches (get_new_batch_prefill() returned None). If new prefill was
+            # admitted (EXTEND batch), decay does NOT happen that step.
+            if self._last_forward_has_decode and not self._last_forward_had_new_prefill:
                 has_decode_requests = any(
                     req.num_computed_tokens >= req.need_prefill_tokens
                     for req in self.running
