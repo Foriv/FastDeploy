@@ -223,6 +223,8 @@ class ResourceManagerV1(ResourceManager):
         # Token budget persists across multiple schedule() calls within a single forward cycle
         self.token_budget: int = 0
         self.schedule_cycle_in_progress: bool = False
+        # Tracks whether the last forward was a DECODE forward (for ratio decay in notify_forward_complete)
+        self._last_forward_is_decode: bool = False
 
         llm_logger.info(
             f"NewTokenRatio initialized: init={self.init_new_token_ratio:.3f}, "
@@ -993,6 +995,20 @@ class ResourceManagerV1(ResourceManager):
             # SGLang-aligned: chunked_prefill_size is per-request limit, token_budget is batch limit
             chunked_prefill_size = self.config.scheduler_config.chunked_prefill_size
 
+            # SGLang non-mixed: decide batch type before scheduling
+            # EXTEND (prefill) takes priority over DECODE, mirroring get_next_batch_to_run():
+            #   1. If any request needs prefill (running chunked or new waiting) → EXTEND batch
+            #   2. Otherwise → DECODE batch on running_batch
+            has_running_prefill = any(
+                r.num_computed_tokens < r.need_prefill_tokens
+                for r in self.running
+            )
+            is_extend_mode = has_running_prefill or bool(self.waiting)
+            llm_logger.debug(
+                f"SGLang batch type: {'EXTEND' if is_extend_mode else 'DECODE'} "
+                f"(running_prefill={has_running_prefill}, waiting={len(self.waiting)})"
+            )
+
             # First, schedule the RUNNING requests.
             req_index = 0
             num_decoding_req_nums = 0
@@ -1007,6 +1023,11 @@ class ResourceManagerV1(ResourceManager):
                 # The need_block_num signal is only for handling worker-side block requests,
                 # but decode scheduling should always happen regardless of this signal
                 if request.num_computed_tokens >= request.need_prefill_tokens:  # to be decoding
+                    if is_extend_mode:
+                        # SGLang non-mixed: skip decode scheduling during EXTEND (prefill) batch.
+                        # These requests will be decoded in the next DECODE batch after prefill completes.
+                        req_index += 1
+                        continue
                     if (
                         self.config.scheduler_config.splitwise_role == "prefill"
                     ):  # do not need to schedule for decoding
@@ -1192,7 +1213,8 @@ class ResourceManagerV1(ResourceManager):
             # Key principle: Only account for NEW decode requests in this cycle
             # - Already-running prefill/decode requests: Already accounted for in previous cycles
             # - This cycle's new decode requests: Only those that will be created from waiting queue
-            if not preempted_reqs:
+            # SGLang non-mixed: waiting queue is only processed in EXTEND mode
+            if not preempted_reqs and is_extend_mode:
                 # Track how many decode requests will be created in this cycle from waiting queue
                 # This is used for prefill threshold calculation
                 scheduled_decode_count_this_cycle = 0
@@ -1359,15 +1381,6 @@ class ResourceManagerV1(ResourceManager):
             if scheduled_reqs:
                 llm_logger.debug(f"schedued_reqs: {scheduled_reqs}")
 
-                # New mechanism: decay new_token_ratio only when there are decode requests
-                has_decode_reqs = any(getattr(r, "task_type", None) == RequestType.DECODE for r in scheduled_reqs)
-                if has_decode_reqs:
-                    self.current_new_token_ratio = max(
-                        self.current_new_token_ratio - self.new_token_ratio_decay,
-                        self.min_new_token_ratio,
-                    )
-                    llm_logger.debug(f"NewTokenRatio decayed to {self.current_new_token_ratio:.4f}")
-
             if (
                 hasattr(self, "scheduler_metrics_logger")
                 and self.scheduler_metrics_logger is not None
@@ -1424,6 +1437,9 @@ class ResourceManagerV1(ResourceManager):
             # if not scheduled_reqs:
             #     self.reset_new_token_ratio_on_idle()
 
+            # Record batch type so notify_forward_complete() can decay ratio correctly
+            self._last_forward_is_decode = not is_extend_mode
+
             # Save token_budget for next schedule() call within the same forward cycle
             self.token_budget = token_budget
 
@@ -1438,8 +1454,12 @@ class ResourceManagerV1(ResourceManager):
 
         Key behaviors:
         1. Reset token_budget for next forward cycle
-        2. Decay new_token_ratio (if there were running decode requests)
+        2. Decay new_token_ratio only after DECODE forwards (not EXTEND/prefill forwards)
         3. Reset new_token_ratio if system is completely idle (like SGLang's self_check_during_idle)
+
+        Batch type mapping to SGLang:
+          EXTEND forward (_last_forward_is_decode=False): no ratio decay
+          DECODE forward (_last_forward_is_decode=True):  decay ratio
         """
         with self.lock:
             # End of schedule cycle
@@ -1448,18 +1468,20 @@ class ResourceManagerV1(ResourceManager):
             # Reset token_budget for next forward cycle
             self.token_budget = self.config.scheduler_config.max_num_batched_tokens
 
-            # SGLang-aligned: decay new_token_ratio after each forward if there were decode requests
-            # Check if there are any running decode requests
-            has_decode_requests = any(
-                req.num_computed_tokens >= req.need_prefill_tokens
-                for req in self.running
-            )
-            if has_decode_requests and self.current_new_token_ratio > self.min_new_token_ratio:
-                self.current_new_token_ratio = max(
-                    self.current_new_token_ratio - self.new_token_ratio_decay,
-                    self.min_new_token_ratio
+            # SGLang non-mixed: only decay new_token_ratio after DECODE forwards.
+            # After an EXTEND (prefill) forward, decode requests are still in self.running
+            # but were NOT scheduled — checking self.running here would incorrectly decay.
+            if self._last_forward_is_decode:
+                has_decode_requests = any(
+                    req.num_computed_tokens >= req.need_prefill_tokens
+                    for req in self.running
                 )
-                llm_logger.debug(f"Decayed new_token_ratio to {self.current_new_token_ratio:.3f}")
+                if has_decode_requests and self.current_new_token_ratio > self.min_new_token_ratio:
+                    self.current_new_token_ratio = max(
+                        self.current_new_token_ratio - self.new_token_ratio_decay,
+                        self.min_new_token_ratio
+                    )
+                    llm_logger.debug(f"Decayed new_token_ratio to {self.current_new_token_ratio:.3f}")
 
             # SGLang-aligned: reset new_token_ratio when completely idle
             # Only reset when both running and waiting queues are empty
