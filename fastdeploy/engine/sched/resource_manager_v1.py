@@ -219,6 +219,11 @@ class ResourceManagerV1(ResourceManager):
         self.current_new_token_ratio = self.init_new_token_ratio
         self.clip_max_new_tokens_estimation = envs.FD_CLIP_MAX_NEW_TOKENS_ESTIMATION
 
+        # SGLang-aligned: schedule cycle state
+        # Token budget persists across multiple schedule() calls within a single forward cycle
+        self.token_budget: int = 0
+        self.schedule_cycle_in_progress: bool = False
+
         llm_logger.info(
             f"NewTokenRatio initialized: init={self.init_new_token_ratio:.3f}, "
             f"min={self.min_new_token_ratio:.3f}, decay_per_step={self.new_token_ratio_decay:.6f}, "
@@ -976,7 +981,15 @@ class ResourceManagerV1(ResourceManager):
             scheduled_reqs: list[Request] = []
             preempted_reqs: list[Request] = []
             error_reqs: list[tuple[str, str]] = []
-            token_budget = self.config.scheduler_config.max_num_batched_tokens
+
+            # SGLang-aligned: token_budget persists across schedule() calls within a forward cycle
+            # If no cycle in progress, initialize token_budget; otherwise use the remaining budget
+            if not self.schedule_cycle_in_progress:
+                token_budget = self.config.scheduler_config.max_num_batched_tokens
+                self.schedule_cycle_in_progress = True
+            else:
+                token_budget = self.token_budget  # Use remaining budget from previous schedule() call
+
             # SGLang-aligned: chunked_prefill_size is per-request limit, token_budget is batch limit
             chunked_prefill_size = self.config.scheduler_config.chunked_prefill_size
 
@@ -1411,10 +1424,52 @@ class ResourceManagerV1(ResourceManager):
             # if not scheduled_reqs:
             #     self.reset_new_token_ratio_on_idle()
 
+            # Save token_budget for next schedule() call within the same forward cycle
+            self.token_budget = token_budget
 
             self.update_metrics()
 
             return scheduled_reqs, error_reqs
+
+    def notify_forward_complete(self):
+        """
+        SGLang-aligned: Called when a forward pass is complete.
+        This marks the end of a schedule cycle and resets state for the next cycle.
+
+        Key behaviors:
+        1. Reset token_budget for next forward cycle
+        2. Decay new_token_ratio (if there were running decode requests)
+        3. Reset new_token_ratio if system is completely idle (like SGLang's self_check_during_idle)
+        """
+        with self.lock:
+            # End of schedule cycle
+            self.schedule_cycle_in_progress = False
+
+            # Reset token_budget for next forward cycle
+            self.token_budget = self.config.scheduler_config.max_num_batched_tokens
+
+            # SGLang-aligned: decay new_token_ratio after each forward if there were decode requests
+            # Check if there are any running decode requests
+            has_decode_requests = any(
+                req.num_computed_tokens >= req.need_prefill_tokens
+                for req in self.running
+            )
+            if has_decode_requests and self.current_new_token_ratio > self.min_new_token_ratio:
+                self.current_new_token_ratio = max(
+                    self.current_new_token_ratio - self.new_token_ratio_decay,
+                    self.min_new_token_ratio
+                )
+                llm_logger.debug(f"Decayed new_token_ratio to {self.current_new_token_ratio:.3f}")
+
+            # SGLang-aligned: reset new_token_ratio when completely idle
+            # Only reset when both running and waiting queues are empty
+            if len(self.running) == 0 and len(self.waiting) == 0:
+                if self.current_new_token_ratio != self.init_new_token_ratio:
+                    llm_logger.debug(
+                        f"System completely idle, resetting new_token_ratio "
+                        f"from {self.current_new_token_ratio:.3f} to {self.init_new_token_ratio:.3f}"
+                    )
+                    self.current_new_token_ratio = self.init_new_token_ratio
 
     def waiting_async_process(self, request: Request) -> None:
         """
