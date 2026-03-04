@@ -570,7 +570,7 @@ class ResourceManagerV1(ResourceManager):
         - For non-last chunks, reserve 0 (they will reserve on final chunk)
 
         Total tokens includes:
-        1. Tokens needed for current prefill (this new request's current chunk)
+        1. Tokens needed for current prefill chunk (current chunk's token count, NOT full input)
         2. Tokens reserved for this request's future decode (max_new_tokens only for last chunk)
         3. Tokens reserved for ALL running decode requests (from previous cycles)
         4. Tokens reserved for NEW decode requests in this cycle
@@ -585,6 +585,7 @@ class ResourceManagerV1(ResourceManager):
         """
         # 1. SGLang-aligned: Use current chunk's token count, not the full prefill
         # This is the key difference - only reserve for what we're actually processing NOW
+        # num_chunk_new_block is the block count for current chunk, multiplied by block_size gives token count
         required_tokens_for_prefill = num_chunk_new_block * self.config.cache_config.block_size
 
         # 2. SGLang-aligned: Only reserve max_new_tokens for the LAST chunk
@@ -1405,9 +1406,11 @@ class ResourceManagerV1(ResourceManager):
                         use_cudagraph=use_decode_cudagraph,
                     )
 
+            #TO DO：avoid frequent calls to reset_new_token_ratio_on_idle
             # SGLang-aligned: reset new_token_ratio when completely idle
-            if not scheduled_reqs:
-                self.reset_new_token_ratio_on_idle()
+            # if not scheduled_reqs:
+            #     self.reset_new_token_ratio_on_idle()
+
 
             self.update_metrics()
 
