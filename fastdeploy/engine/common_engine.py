@@ -146,6 +146,8 @@ class EngineService:
             split_connector=self.split_connector,
         )
         self.token_processor.set_resource_manager(self.resource_manager)
+        # SGLang-aligned: set token_processor reference for forward_done event
+        self.resource_manager.token_processor = self.token_processor
 
         self.scheduler_metrics_logger = SchedulerMetricsLogger(
             enabled=True,

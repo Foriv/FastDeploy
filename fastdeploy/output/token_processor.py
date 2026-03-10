@@ -71,6 +71,9 @@ class TokenProcessor:
         self.tokens_counter = Counter()
         self.split_connector = split_connector
 
+        # SGLang-aligned: forward_done event to signal scheduler when forward completes
+        self.forward_done = threading.Event()
+
         if envs.FD_USE_GET_SAVE_OUTPUT_V1:
             llm_logger.debug(f"create zmq get_save_output_rank{self.cfg.parallel_config.local_data_parallel_id}")
             self.zmq_server = ZmqIpcServer(
@@ -510,6 +513,10 @@ class TokenProcessor:
                 self.cached_generated_tokens.put_results(batch_result)
         except Exception as e:
             llm_logger.error(f"Error in TokenProcessor's postprocess: {e}, {str(traceback.format_exc())}")
+
+        # SGLang-aligned: signal forward completion to scheduler for rem_input_tokens initialization
+        if hasattr(self, 'forward_done'):
+            self.forward_done.set()
 
     def _recycle_resources(self, task_id, index, task, result=None, is_prefill=False):
         """

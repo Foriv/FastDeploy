@@ -178,6 +178,9 @@ class ResourceManagerV1(ResourceManager):
         self.reuse_block_num_map = dict()
         self.abort_req_ids_set = set()
 
+        # SGLang-aligned: reference to token_processor for forward_done event
+        self.token_processor = None
+
         # need block nums
         need_block_num_data = np.zeros([max_num_seqs], dtype=np.int32)
         self.need_block_num_signal = IPCSignal(
@@ -247,7 +250,8 @@ class ResourceManagerV1(ResourceManager):
                 if process_func is not None:
                     process_func(request)
                 llm_logger.debug(f"self.waiting append request:{request.request_id},req.type:{request.status}")
-                self.waiting.appendleft(request)
+                # SGLang-aligned: add preempted request to end of waiting queue to prevent jitter
+                self.waiting.append(request)
                 self.to_be_rescheduled_request_id_set.remove(request_id)
 
     def _info_each_block(self):
@@ -662,12 +666,28 @@ class ResourceManagerV1(ResourceManager):
             scheduled_reqs: list[Request] = []
             preempted_reqs: list[Request] = []
             error_reqs: list[tuple[str, str]] = []
-            token_budget = self.config.scheduler_config.max_num_batched_tokens
+
+            # SGLang-aligned: check if forward is done to initialize rem_input_tokens
+            # Only initialize rem_input_tokens after forward completes (token_processor signals forward_done)
+            if self.token_processor is not None and hasattr(self.token_processor, 'forward_done'):
+                if self.token_processor.forward_done.is_set():
+                    # Forward just completed, clear the event and start new cycle
+                    self.token_processor.forward_done.clear()
+                    # Initialize rem_input_tokens for new forward cycle
+                    self._rem_input_tokens = self.config.scheduler_config.max_num_batched_tokens
+                elif not hasattr(self, '_rem_input_tokens'):
+                    # First time or _rem_input_tokens not initialized, initialize it
+                    self._rem_input_tokens = self.config.scheduler_config.max_num_batched_tokens
+                # If forward_done is not set but _rem_input_tokens exists, keep using existing value
+            else:
+                # Fallback: initialize if token_processor not available
+                if not hasattr(self, '_rem_input_tokens'):
+                    self._rem_input_tokens = self.config.scheduler_config.max_num_batched_tokens
 
             # First, schedule the RUNNING requests.
             req_index = 0
             num_decoding_req_nums = 0
-            while req_index < len(self.running) and token_budget > 0:
+            while req_index < len(self.running):
                 request = self.running[req_index]
                 need_block_num = self.need_block_num_signal.value[request.idx]
                 if need_block_num != 0:
@@ -714,7 +734,6 @@ class ResourceManagerV1(ResourceManager):
                             # Prepare decoding task
                             scheduled_reqs.append(self._prepare_decode_task(request))
                         num_decoding_req_nums += 1
-                    token_budget -= 1
                     if (
                         request.use_extend_tables
                         and request.request_id not in self.using_extend_tables_req_id
@@ -776,18 +795,25 @@ class ResourceManagerV1(ResourceManager):
                         f"request.need_prefill_tokens {request.need_prefill_tokens},"
                         f"request.num_computed_tokens {request.num_computed_tokens}"
                     )
+                    # Initialize rem_input_tokens for running prefill (SGLang-aligned)
+                    if req_index == 0:
+                        chunked_prefill_size = self.config.scheduler_config.chunked_prefill_size
+                        rem_input_tokens = self.config.scheduler_config.max_num_batched_tokens - num_decoding_req_nums
                     if (
                         current_platform.is_intel_hpu()
                         and request.need_prefill_tokens - request.num_computed_tokens
                         >= self.config.cache_config.block_size
-                        and token_budget < self.config.cache_config.block_size
+                        and rem_input_tokens < self.config.cache_config.block_size
                     ):
                         req_index += 1
                         continue
                     if get_enough_request(request, scheduled_reqs):
                         req_index += 1
                         continue
-                    num_new_tokens = self._get_num_new_tokens(request, token_budget)
+                    # SGLang-aligned: prefill uses min(chunked_prefill_size, rem_input_tokens)
+                    num_new_tokens = self._get_num_new_tokens(
+                        request, min(chunked_prefill_size, rem_input_tokens)
+                    )
                     num_new_block = self.get_new_block_nums(request, num_new_tokens)
                     # Allocate blocks to prefill
                     if self.cache_manager.can_allocate_gpu_blocks(num_new_block):
@@ -805,7 +831,7 @@ class ResourceManagerV1(ResourceManager):
                         )
                         # Prepare prefill task
                         scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
-                    token_budget -= num_new_tokens
+                    rem_input_tokens -= num_new_tokens
                     request.num_computed_tokens += num_new_tokens
                     if self.config.cache_config.enable_prefix_caching:
                         self.cache_manager.update_cache_blocks(
@@ -813,10 +839,16 @@ class ResourceManagerV1(ResourceManager):
                         )
                 req_index += 1
 
+            # Calculate remaining input tokens: reserve 1 token per decode request
+            # SGLang-aligned: use instance variable _rem_input_tokens
+            chunked_prefill_size = self.config.scheduler_config.chunked_prefill_size
+            self._rem_input_tokens -= num_decoding_req_nums  # Reserve 1 token per decode request
+            rem_input_tokens = self._rem_input_tokens
+
             # Second, schedule the WAITING requests.
             if not preempted_reqs:
                 skip_requests: list[Request] = []
-                while self.waiting and token_budget > 0:
+                while self.waiting and rem_input_tokens > 0:
                     if len(self.running) == self.max_num_seqs:
                         break
 
@@ -856,11 +888,13 @@ class ResourceManagerV1(ResourceManager):
                             current_platform.is_intel_hpu()
                             and request.need_prefill_tokens - request.num_computed_tokens
                             >= self.config.cache_config.block_size
-                            and token_budget < self.config.cache_config.block_size
+                            and rem_input_tokens < self.config.cache_config.block_size
                         ):
                             continue
-                        # Allocate blocks for the tokens that does not hit cache
-                        num_new_tokens = self._get_num_new_tokens(request, token_budget)
+                        # SGLang-aligned: prefill uses min(chunked_prefill_size, rem_input_tokens)
+                        num_new_tokens = self._get_num_new_tokens(
+                            request, min(chunked_prefill_size, rem_input_tokens)
+                        )
                         num_new_block = self.get_new_block_nums(request, num_new_tokens)
                         can_schedule_block_num_threshold = self._get_can_schedule_prefill_threshold_block(
                             request, num_new_block
@@ -875,7 +909,7 @@ class ResourceManagerV1(ResourceManager):
                             self.waiting.popleft()
                             self.running.append(request)
                             scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
-                            token_budget -= num_new_tokens
+                            rem_input_tokens -= num_new_tokens
                             request.num_computed_tokens += num_new_tokens
                             if self.config.cache_config.enable_prefix_caching:
                                 self.cache_manager.update_cache_blocks(
@@ -912,8 +946,10 @@ class ResourceManagerV1(ResourceManager):
                                 self._free_blocks(request)
                                 break
 
-                        # Allocate blocks for the tokens that does not hit cache
-                        num_new_tokens = self._get_num_new_tokens(request, token_budget)
+                        # SGLang-aligned: prefill uses min(chunked_prefill_size, rem_input_tokens)
+                        num_new_tokens = self._get_num_new_tokens(
+                            request, min(chunked_prefill_size, rem_input_tokens)
+                        )
                         num_new_block = self.get_new_block_nums(request, num_new_tokens)
                         can_schedule_block_num_threshold = self._get_can_schedule_prefill_threshold_block(
                             request, num_new_block
@@ -928,7 +964,7 @@ class ResourceManagerV1(ResourceManager):
                             self.waiting.popleft()
                             self.running.append(request)
                             scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
-                            token_budget -= num_new_tokens
+                            rem_input_tokens -= num_new_tokens
                             request.num_computed_tokens += num_new_tokens
                             if self.config.cache_config.enable_prefix_caching:
                                 self.cache_manager.update_cache_blocks(
