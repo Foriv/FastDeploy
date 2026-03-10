@@ -687,6 +687,8 @@ class ResourceManagerV1(ResourceManager):
             # First, schedule the RUNNING requests.
             req_index = 0
             num_decoding_req_nums = 0
+            # SGLang-aligned: initialize rem_input_tokens before processing running requests
+            rem_input_tokens = self._rem_input_tokens
             while req_index < len(self.running):
                 request = self.running[req_index]
                 need_block_num = self.need_block_num_signal.value[request.idx]
@@ -795,10 +797,6 @@ class ResourceManagerV1(ResourceManager):
                         f"request.need_prefill_tokens {request.need_prefill_tokens},"
                         f"request.num_computed_tokens {request.num_computed_tokens}"
                     )
-                    # Initialize rem_input_tokens for running prefill (SGLang-aligned)
-                    if req_index == 0:
-                        chunked_prefill_size = self.config.scheduler_config.chunked_prefill_size
-                        rem_input_tokens = self.config.scheduler_config.max_num_batched_tokens - num_decoding_req_nums
                     if (
                         current_platform.is_intel_hpu()
                         and request.need_prefill_tokens - request.num_computed_tokens
@@ -812,7 +810,7 @@ class ResourceManagerV1(ResourceManager):
                         continue
                     # SGLang-aligned: prefill uses min(chunked_prefill_size, rem_input_tokens)
                     num_new_tokens = self._get_num_new_tokens(
-                        request, min(chunked_prefill_size, rem_input_tokens)
+                        request, min(self.config.scheduler_config.chunked_prefill_size, rem_input_tokens)
                     )
                     num_new_block = self.get_new_block_nums(request, num_new_tokens)
                     # Allocate blocks to prefill
