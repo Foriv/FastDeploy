@@ -193,9 +193,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use phi FP8 quantization,if 1,use paddle default.
     "FD_USE_PHI_FP8_QUANT": lambda: bool(int(os.getenv("FD_USE_PHI_FP8_QUANT", "1"))),
     # Reserve tokens  when schedule
-    "FD_INIT_NEW_TOKEN_RATIO": lambda: float(os.getenv("FD_INIT_NEW_TOKEN_RATIO", "0.7")),
-    "FD_MIN_NEW_TOKEN_RATIO_FACTOR": lambda: float(os.getenv("FD_MIN_NEW_TOKEN_RATIO_FACTOR", "0.14")),
-    "FD_NEW_TOKEN_RATIO_DECAY_STEPS": lambda: int(os.getenv("FD_NEW_TOKEN_RATIO_DECAY_STEPS", "600")),
+    "FD_INIT_NEW_TOKEN_RATIO": lambda: float(os.getenv("FD_INIT_NEW_TOKEN_RATIO", "0.2")),
+    "FD_MIN_NEW_TOKEN_RATIO_FACTOR": lambda: float(os.getenv("FD_MIN_NEW_TOKEN_RATIO_FACTOR", "0.1")),
+    "FD_NEW_TOKEN_RATIO_DECAY_STEPS": lambda: int(os.getenv("FD_NEW_TOKEN_RATIO_DECAY_STEPS", "300")),
     "FD_RETRACT_DECODE_STEPS": lambda: int(os.getenv("FD_RETRACT_DECODE_STEPS", "20")),
     "FD_CLIP_MAX_NEW_TOKENS_ESTIMATION": lambda: int(os.getenv("FD_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")), 
     # Timeout for worker process health check in seconds

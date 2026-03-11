@@ -219,10 +219,6 @@ class ResourceManagerV1(ResourceManager):
         self.current_new_token_ratio = self.init_new_token_ratio
         self.clip_max_new_tokens_estimation = envs.FD_CLIP_MAX_NEW_TOKENS_ESTIMATION
 
-        # Tracks whether the last scheduled forward had decode requests.
-        # Used in notify_forward_complete() to guard ratio decay (SGLang-aligned).
-        self._last_forward_has_decode: bool = False
-
         llm_logger.info(
             f"NewTokenRatio initialized: init={self.init_new_token_ratio:.3f}, "
             f"min={self.min_new_token_ratio:.3f}, decay_per_step={self.new_token_ratio_decay:.6f}, "
@@ -1074,9 +1070,7 @@ class ResourceManagerV1(ResourceManager):
                     else:
                         scheduled_reqs.append(self._prepare_decode_task(request))
 
-                    # NOTE: Decode no longer consumes token_budget here
-                    # SGLang-aligned: token_budget is only used for prefill requests
-                    # Decode only needs block allocation, not token budget
+
                     num_decoding_req_nums += 1
                     if (
                         request.use_extend_tables
@@ -1431,48 +1425,22 @@ class ResourceManagerV1(ResourceManager):
             # if not scheduled_reqs:
             #     self.reset_new_token_ratio_on_idle()
 
-            # Record whether this forward had decode requests scheduled,
-            # so notify_forward_complete() can decay ratio correctly.
-            # SGLang: decay only happens before DECODE forwards (update_running_batch),
-            # not before EXTEND (prefill) forwards.
-            self._last_forward_has_decode = any(
-                getattr(r, "task_type", None) == RequestType.DECODE
-                for r in scheduled_reqs
+            # SGLang-aligned: decay new_token_ratio after each schedule cycle
+            # if there are decode requests running (similar to update_running_batch in SGLang)
+            has_decode_requests = any(
+                req.num_computed_tokens >= req.need_prefill_tokens
+                for req in self.running
             )
+            if has_decode_requests and self.current_new_token_ratio > self.min_new_token_ratio:
+                self.current_new_token_ratio = max(
+                    self.current_new_token_ratio - self.new_token_ratio_decay,
+                    self.min_new_token_ratio
+                )
+                llm_logger.debug(f"Decayed new_token_ratio to {self.current_new_token_ratio:.3f}")
 
             self.update_metrics()
 
             return scheduled_reqs, error_reqs
-
-    def notify_forward_complete(self):
-        """
-        Called when a forward pass is complete.
-        Decays new_token_ratio if decode requests are running.
-        """
-        with self.lock:
-            # SGLang-aligned: only decay when the last forward actually had decode requests.
-            # FD is always mixed (prefill+decode together), so decay whenever decode is present.
-            if self._last_forward_has_decode:
-                has_decode_requests = any(
-                    req.num_computed_tokens >= req.need_prefill_tokens
-                    for req in self.running
-                )
-                if has_decode_requests and self.current_new_token_ratio > self.min_new_token_ratio:
-                    self.current_new_token_ratio = max(
-                        self.current_new_token_ratio - self.new_token_ratio_decay,
-                        self.min_new_token_ratio
-                    )
-                    llm_logger.debug(f"Decayed new_token_ratio to {self.current_new_token_ratio:.3f}")
-
-            # SGLang-aligned: reset new_token_ratio when completely idle
-            # Only reset when both running and waiting queues are empty
-            if len(self.running) == 0 and len(self.waiting) == 0:
-                if self.current_new_token_ratio != self.init_new_token_ratio:
-                    llm_logger.debug(
-                        f"System completely idle, resetting new_token_ratio "
-                        f"from {self.current_new_token_ratio:.3f} to {self.init_new_token_ratio:.3f}"
-                    )
-                    self.current_new_token_ratio = self.init_new_token_ratio
 
     def waiting_async_process(self, request: Request) -> None:
         """

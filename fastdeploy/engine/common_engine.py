@@ -102,10 +102,6 @@ class EngineService:
         self.is_paused = False  # pause request generation
         self._pause_cond = threading.Condition()
 
-        # SGLang-aligned: forward cycle state tracking
-        self._forward_in_progress = False  # for _schedule_request_to_worker
-        self._forward_in_progress_v1 = False  # for _schedule_request_to_worker_v1
-
         self._ctrl_worker_output_queues = []
         tp_size = cfg.parallel_config.tensor_parallel_size
         dp_index = cfg.parallel_config.local_data_parallel_id
@@ -733,18 +729,9 @@ class EngineService:
         """
         tracing.trace_set_thread_info("Scheduler Task to Work")
         current_id = 0
-        # SGLang-aligned: track if forward is in progress
-        forward_in_progress = False
 
         while getattr(self, "running", True):
             try:
-                # SGLang-aligned: detect forward completion
-                # When exist_tasks() changes from True to False, forward just completed
-                has_running_tasks = self.engine_worker_queue.exist_tasks()
-                if forward_in_progress and not has_running_tasks:
-                    # Forward just completed, notify scheduler
-                    self.resource_manager.notify_forward_complete()
-                forward_in_progress = has_running_tasks
 
                 if self.resource_manager.available_batch() == 0:
                     time.sleep(0.001)
@@ -991,10 +978,6 @@ class EngineService:
                 self._pause_cond.wait_for(lambda: not self.is_paused)
             try:
                 # SGLang-aligned: detect forward completion (same as in _schedule_request_to_worker)
-                has_running_tasks = self.engine_worker_queue.exist_tasks()
-                if self._forward_in_progress_v1 and not has_running_tasks:
-                    self.resource_manager.notify_forward_complete()
-                self._forward_in_progress_v1 = has_running_tasks
 
                 if self.engine_worker_queue.exist_tasks():
                     time.sleep(0.001)
