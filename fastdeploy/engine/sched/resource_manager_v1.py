@@ -738,6 +738,22 @@ class ResourceManagerV1(ResourceManager):
                 break
         return matched_token_num
 
+    def _ceil_paged_tokens(self, tokens: int) -> int:
+        """Align token count up to the nearest block_size multiple.
+
+        Mirrors SGLang's ceil_paged_tokens (schedule_policy.py:486):
+            return -(-tokens // self.page_size) * self.page_size
+
+        This ensures the scheduler's token-budget deduction matches the actual
+        block-granularity memory consumed by the underlying allocator, preventing
+        the scheduler from admitting more prefill work than there is KV-cache
+        space to hold it.
+        """
+        block_size = self.config.cache_config.block_size
+        if block_size <= 1:
+            return tokens
+        return -(-tokens // block_size) * block_size
+
     def _get_num_new_tokens(self, request, chunked_prefill_size, token_budget):
         # SGLang-aligned: use min(chunked_prefill_size, token_budget) as the limit
         # chunked_prefill_size is the max tokens for a single request (like SGLang's rem_chunk_tokens)
@@ -1165,8 +1181,11 @@ class ResourceManagerV1(ResourceManager):
                         )
                         # Prepare prefill task
                         scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
-                    # SGLang-aligned: running chunked prefill also consumes token_budget
-                    token_budget -= num_new_tokens
+                    # SGLang-aligned: running chunked prefill also consumes token_budget.
+                    # Deduct ceil-aligned token count so the budget matches actual block
+                    # allocation granularity, preventing over-scheduling (SGLang:
+                    # _update_prefill_budget uses ceil_paged_tokens before deducting).
+                    token_budget -= self._ceil_paged_tokens(num_new_tokens)
                     request.num_computed_tokens += num_new_tokens
                     if self.config.cache_config.enable_prefix_caching:
                         self.cache_manager.update_cache_blocks(
@@ -1277,7 +1296,10 @@ class ResourceManagerV1(ResourceManager):
                                 f"total new_decode_reserved={scheduled_new_decode_reserved_tokens:.1f}"
                             )
 
-                        token_budget -= num_new_tokens
+                        # Deduct ceil-aligned token count so the budget matches actual block
+                        # allocation granularity (SGLang: ceil_paged_tokens before deducting
+                        # rem_input_tokens in _update_prefill_budget).
+                        token_budget -= self._ceil_paged_tokens(num_new_tokens)
                         request.num_computed_tokens += num_new_tokens
                         if self.config.cache_config.enable_prefix_caching:
                             self.cache_manager.update_cache_blocks(
@@ -1352,7 +1374,10 @@ class ResourceManagerV1(ResourceManager):
                             _max_new_tok = min(_max_new_tok, self.clip_max_new_tokens_estimation)
                             scheduled_new_decode_reserved_tokens += _max_new_tok
 
-                        token_budget -= num_new_tokens
+                        # Deduct ceil-aligned token count so the budget matches actual block
+                        # allocation granularity (SGLang: ceil_paged_tokens before deducting
+                        # rem_input_tokens in _update_prefill_budget).
+                        token_budget -= self._ceil_paged_tokens(num_new_tokens)
                         request.num_computed_tokens += num_new_tokens
                         if self.config.cache_config.enable_prefix_caching:
                             self.cache_manager.update_cache_blocks(
