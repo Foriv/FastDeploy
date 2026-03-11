@@ -219,10 +219,6 @@ class ResourceManagerV1(ResourceManager):
         self.current_new_token_ratio = self.init_new_token_ratio
         self.clip_max_new_tokens_estimation = envs.FD_CLIP_MAX_NEW_TOKENS_ESTIMATION
 
-        # SGLang-aligned: schedule cycle state
-        # Token budget persists across multiple schedule() calls within a single forward cycle
-        self.token_budget: int = 0
-        self.schedule_cycle_in_progress: bool = False
         # Tracks whether the last scheduled forward had decode requests.
         # Used in notify_forward_complete() to guard ratio decay (SGLang-aligned).
         self._last_forward_has_decode: bool = False
@@ -964,19 +960,13 @@ class ResourceManagerV1(ResourceManager):
             preempted_reqs: list[Request] = []
             error_reqs: list[tuple[str, str]] = []
 
-            # SGLang-aligned: token_budget persists across schedule() calls within a forward cycle
-            # If no cycle in progress, initialize token_budget; otherwise use the remaining budget
-            if not self.schedule_cycle_in_progress:
-                # SGLang mixed_chunk: subtract running_bs (one token per decode req) from budget
-                # mirrors: rem_input_tokens = max_prefill_tokens - mixed_with_decode_tokens
-                running_decode_count = sum(
-                    1 for r in self.running
-                    if r.num_computed_tokens >= r.need_prefill_tokens
-                )
-                token_budget = self.config.scheduler_config.max_num_batched_tokens - running_decode_count
-                self.schedule_cycle_in_progress = True
-            else:
-                token_budget = self.token_budget  # Use remaining budget from previous schedule() call
+            # Initialize token_budget for this schedule call
+            # SGLang mixed_chunk: subtract running_bs (one token per decode req) from budget
+            running_decode_count = sum(
+                1 for r in self.running
+                if r.num_computed_tokens >= r.need_prefill_tokens
+            )
+            token_budget = self.config.scheduler_config.max_num_batched_tokens - running_decode_count
 
             # SGLang-aligned: chunked_prefill_size is per-request limit, token_budget is batch limit
             chunked_prefill_size = self.config.scheduler_config.chunked_prefill_size
@@ -1449,8 +1439,6 @@ class ResourceManagerV1(ResourceManager):
                 getattr(r, "task_type", None) == RequestType.DECODE
                 for r in scheduled_reqs
             )
-            # Save token_budget for next schedule() call within the same forward cycle
-            self.token_budget = token_budget
 
             self.update_metrics()
 
@@ -1459,15 +1447,9 @@ class ResourceManagerV1(ResourceManager):
     def notify_forward_complete(self):
         """
         Called when a forward pass is complete.
-        Resets schedule cycle state and decays new_token_ratio if decode requests are running.
+        Decays new_token_ratio if decode requests are running.
         """
         with self.lock:
-            # End of schedule cycle
-            self.schedule_cycle_in_progress = False
-
-            # Reset token_budget for next forward cycle
-            self.token_budget = self.config.scheduler_config.max_num_batched_tokens
-
             # SGLang-aligned: only decay when the last forward actually had decode requests.
             # FD is always mixed (prefill+decode together), so decay whenever decode is present.
             if self._last_forward_has_decode:
