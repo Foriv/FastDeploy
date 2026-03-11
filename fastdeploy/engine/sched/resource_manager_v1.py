@@ -758,15 +758,24 @@ class ResourceManagerV1(ResourceManager):
         # SGLang-aligned: use min(chunked_prefill_size, token_budget) as the limit
         # chunked_prefill_size is the max tokens for a single request (like SGLang's rem_chunk_tokens)
         # token_budget (max_num_batched_tokens) is the total batch budget (like SGLang's rem_total_tokens)
-        num_new_tokens = request.need_prefill_tokens - request.num_computed_tokens
+        remaining = request.need_prefill_tokens - request.num_computed_tokens
         # SGLang logic: _rem_tokens = min(rem_chunk_tokens, rem_total_tokens)
-        num_new_tokens = min(num_new_tokens, chunked_prefill_size, token_budget)
-        if (
-            current_platform.is_intel_hpu()
-            and request.need_prefill_tokens - request.num_computed_tokens > min(chunked_prefill_size, token_budget)
-            and min(chunked_prefill_size, token_budget) > self.config.cache_config.block_size
-        ):
-            num_new_tokens = min(chunked_prefill_size, token_budget) // self.config.cache_config.block_size * self.config.cache_config.block_size
+        num_new_tokens = min(remaining, chunked_prefill_size, token_budget)
+
+        block_size = self.config.cache_config.block_size
+        is_truncated = num_new_tokens < remaining
+
+        if current_platform.is_intel_hpu():
+            # HPU: align down when truncated and limit exceeds one block
+            if is_truncated and min(chunked_prefill_size, token_budget) > block_size:
+                num_new_tokens = num_new_tokens // block_size * block_size
+        elif block_size > 1 and is_truncated:
+            # GPU/others: mirror SGLang's chunked-prefill truncation alignment:
+            #   trunc_len = rem_chunk_tokens // page_size * page_size  (floor)
+            # This ensures the truncated chunk fills whole blocks, avoiding
+            # cross-block fragmentation at chunk boundaries.
+            num_new_tokens = num_new_tokens // block_size * block_size
+
         request.with_image = False
 
         if not self.config.model_config.enable_mm:
@@ -1161,6 +1170,10 @@ class ResourceManagerV1(ResourceManager):
                     # is called which deducts extend_input_len from both budgets.
                     # Here: min(chunked_prefill_size, token_budget) mirrors min(rem_chunk_tokens, rem_total_tokens)
                     num_new_tokens = self._get_num_new_tokens(request, chunked_prefill_size, token_budget)
+                    # SGLang: trunc_len <= 0 → AddReqResult.OTHER (skip this request for now)
+                    if num_new_tokens <= 0:
+                        req_index += 1
+                        continue
                     num_new_block = self.get_new_block_nums(request, num_new_tokens)
                     # Allocate blocks to prefill
                     if self.cache_manager.can_allocate_gpu_blocks(num_new_block):
