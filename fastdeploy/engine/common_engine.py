@@ -987,22 +987,6 @@ class EngineService:
                 self.llm_logger.error(f"fetching request error {e} {str(traceback.format_exc())}")
                 is_fetching = False
 
-        enable_overlap = self.cfg.scheduler_config.enable_overlap_schedule
-        # Overlap scheduling state: pre-scheduled batch waiting for GPU forward to finish.
-        # Mirrors SGLang's result_queue (depth-1 pipeline): CPU schedules batch N+1 while
-        # GPU executes batch N, then dispatches N+1 as soon as signal turns 0.
-        pending_tasks: list | None = None
-        pending_error_tasks: list | None = None
-        # Track whether the last dispatched batch contained prefill requests.
-        # Used to implement SGLang's "consecutive prefill" TTFT optimisation:
-        # when two back-to-back batches are both EXTEND, disable overlap so
-        # that the first prefill's output is returned to the client sooner.
-        last_batch_has_prefill: bool = False
-
-        def _has_prefill(task_list) -> bool:
-            from fastdeploy.engine.sched.resource_manager_v1 import RequestType as RT
-            return any(getattr(t, "task_type", None) == RT.PREFILL for t in task_list)
-
         def _dispatch_tasks(task_list, err_list):
             """Emit tracing spans and push tasks into the engine-worker queue."""
             if task_list:
@@ -1062,6 +1046,14 @@ class EngineService:
             with self._pause_cond:
                 self._pause_cond.wait_for(lambda: not self.is_paused)
             try:
+                # Wait until worker has consumed the current task batch before scheduling the next one.
+                # Unlike the old approach, we do NOT wait for engine_forward_signal here — the worker's
+                # execute_model_overlap() already handles GPU/CPU overlap internally (same as SGLang's
+                # event_loop_overlap: save last-batch output while running current-batch forward).
+                if self.engine_worker_queue.exist_tasks():
+                    time.sleep(0.001)
+                    continue
+
                 if not is_fetching:
                     # Check if the thread pool is still available to avoid submitting tasks to a shutdown thread pool.
                     try:
@@ -1074,118 +1066,21 @@ class EngineService:
                         else:
                             raise
 
-                if enable_overlap:
-                    # -------------------------------------------------------
-                    # Overlap scheduling loop (mirrors SGLang event_loop_overlap)
-                    #
-                    # Pipeline (depth-1):
-                    #   iter N  : schedule(N) while GPU is idle or running N-1
-                    #             → if GPU busy: stash as pending_tasks
-                    #             → if GPU idle: dispatch immediately
-                    #   iter N+1: GPU finishes N (signal→0) → dispatch pending(N)
-                    #             → immediately schedule(N+1) without waiting
-                    #
-                    # Consecutive-prefill exception (SGLang TTFT optimisation):
-                    #   If both current and last batch are EXTEND (prefill), we
-                    #   disable overlap: wait for forward to finish before
-                    #   scheduling, so the first prefill's TTFT is minimised.
-                    # -------------------------------------------------------
+                # 2. Schedule requests
+                tasks, error_tasks = self.resource_manager.schedule()
 
-                    # Phase 1: drain pending batch once forward is done
-                    if pending_tasks is not None:
-                        if self.engine_forward_signal.value[0] != 0:
-                            time.sleep(0.001)
-                            continue
-                        # Forward complete — dispatch the pre-scheduled batch
-                        _dispatch_tasks(pending_tasks, pending_error_tasks)
-                        last_batch_has_prefill = _has_prefill(pending_tasks)
-                        pending_tasks = None
-                        pending_error_tasks = None
-                        # Fall through immediately to schedule the next batch
+                # 3. Dispatch to worker
+                _dispatch_tasks(tasks, error_tasks)
 
-                    # Phase 2: wait until the worker has picked up current tasks
-                    if self.engine_worker_queue.num_tasks() != 0:
-                        time.sleep(0.001)
-                        continue
+                # 4. EP idle batch
+                if not tasks:
+                    if self.cfg.parallel_config.enable_expert_parallel:
+                        self.engine_worker_queue.put_tasks(
+                            ([], self.resource_manager.real_bsz)
+                        )  # Empty batch for ep barrier sync
 
-                    # Phase 3: schedule next batch (CPU work)
-                    _sched_t0 = time.time()
-                    tasks, error_tasks = self.resource_manager.schedule()
-                    _sched_ms = (time.time() - _sched_t0) * 1000
-                    self.llm_logger.debug(f"schedule() cost: {_sched_ms:.2f}ms, tasks={len(tasks)}")
-
-                    if tasks:
-                        current_has_prefill = _has_prefill(tasks)
-                        # Disable overlap for two consecutive prefill batches to
-                        # improve TTFT of the first batch (SGLang strategy).
-                        disable_overlap_for_batch = (
-                            envs.FD_DISABLE_CONSECUTIVE_PREFILL_OVERLAP
-                            and last_batch_has_prefill
-                            and current_has_prefill
-                        )
-                        if self.engine_forward_signal.value[0] == 0 or disable_overlap_for_batch:
-                            # GPU is idle OR consecutive-prefill: dispatch now
-                            _dispatch_tasks(tasks, error_tasks)
-                            last_batch_has_prefill = current_has_prefill
-                        else:
-                            # GPU is busy executing previous batch — pre-schedule:
-                            # stash and dispatch when forward completes (next iter)
-                            pending_tasks = tasks
-                            pending_error_tasks = error_tasks
-                            last_batch_has_prefill = current_has_prefill
-                            self.llm_logger.debug(
-                                f"overlap: pre-scheduled {len(tasks)} tasks while GPU running"
-                            )
-                    elif error_tasks:
-                        for request_id, failed in error_tasks:
-                            if failed is None:
-                                self.llm_logger.warning(
-                                    f"Request {request_id} has no error, skip sending error response."
-                                )
-                                continue
-                            self._send_error_response(request_id, failed)
-                    else:
-                        # No tasks: send empty batch to EP workers so their barrier doesn't hang.
-                        if self.cfg.parallel_config.enable_expert_parallel:
-                            self.engine_worker_queue.put_tasks(
-                                ([], self.resource_manager.real_bsz)
-                            )
-                        else:
-                            time.sleep(0.005)
-
-                else:
-                    # -------------------------------------------------------
-                    # Original non-overlap loop
-                    # Continue preprocessing incoming requests and accumulating
-                    # them in the queue when forward pass is not finished. Once
-                    # the forward pass finishes, these accumulated requests can
-                    # be scheduled in larger, more efficient batches.
-                    # -------------------------------------------------------
-                    if not (
-                        self.engine_worker_queue.num_tasks() == 0
-                        and self.engine_forward_signal.value[0] == 0
-                    ):
-                        time.sleep(0.001)
-                        continue
-
-                    # 2. Schedule requests
-                    _sched_t0 = time.time()
-                    tasks, error_tasks = self.resource_manager.schedule()
-                    _sched_ms = (time.time() - _sched_t0) * 1000
-                    self.llm_logger.debug(f"schedule() cost: {_sched_ms:.2f}ms, tasks={len(tasks)}")
-
-                    # 3. Send to engine
-                    _dispatch_tasks(tasks, error_tasks)
-
-                    # 4. EP idle batch
-                    if not tasks:
-                        if self.cfg.parallel_config.enable_expert_parallel:
-                            self.engine_worker_queue.put_tasks(
-                                ([], self.resource_manager.real_bsz)
-                            )  # Empty (as idle tasks for ep)
-
-                    if not tasks and not error_tasks:
-                        time.sleep(0.005)
+                if not tasks and not error_tasks:
+                    time.sleep(0.005)
 
             except RuntimeError as e:
                 if "cannot schedule new futures after shutdown" in str(e):

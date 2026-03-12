@@ -205,12 +205,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use PD REORDER, can set 0 or 1
     "FD_PD_REORDER": lambda: int(os.getenv("FD_PD_REORDER", "0")),
     # Whether to disable overlap scheduling for two consecutive prefill batches.
-    # When True (default), back-to-back prefill batches run synchronously to
-    # minimise TTFT of the first batch (mirrors SGLang's
-    # SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP=true behaviour).
-    # Set to 0 to allow overlap even between consecutive prefill batches.
+    # When True, back-to-back prefill batches run synchronously (no overlap).
+    # Default is False — mirrors SGLang's EnvBool(False) for
+    # SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP, i.e. overlap IS allowed
+    # for consecutive prefill batches by default.
+    # Set FD_DISABLE_CONSECUTIVE_PREFILL_OVERLAP=1 to disable.
     "FD_DISABLE_CONSECUTIVE_PREFILL_OVERLAP": lambda: bool(
-        int(os.getenv("FD_DISABLE_CONSECUTIVE_PREFILL_OVERLAP", "1"))
+        int(os.getenv("FD_DISABLE_CONSECUTIVE_PREFILL_OVERLAP", "0"))
     ),
 }
 
