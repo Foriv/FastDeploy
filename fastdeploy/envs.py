@@ -204,6 +204,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FILE_BACKEND_STORAGE_DIR": lambda: str(os.getenv("FILE_BACKEND_STORAGE_DIR", "/tmp/fastdeploy")),
     # Whether to use PD REORDER, can set 0 or 1
     "FD_PD_REORDER": lambda: int(os.getenv("FD_PD_REORDER", "0")),
+    # Whether to disable overlap scheduling for two consecutive prefill batches.
+    # When True (default), back-to-back prefill batches run synchronously to
+    # minimise TTFT of the first batch (mirrors SGLang's
+    # SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP=true behaviour).
+    # Set to 0 to allow overlap even between consecutive prefill batches.
+    "FD_DISABLE_CONSECUTIVE_PREFILL_OVERLAP": lambda: bool(
+        int(os.getenv("FD_DISABLE_CONSECUTIVE_PREFILL_OVERLAP", "1"))
+    ),
 }
 
 

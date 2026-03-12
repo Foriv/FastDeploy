@@ -283,6 +283,18 @@ class PaddleDisWorkerProc:
             create=False,
         )
 
+        # init engine_forward_signal: worker sets this to 1 when a forward pass
+        # begins and back to 0 when it completes, so the engine scheduling loop
+        # can wait until forward is done before running the next schedule().
+        engine_forward_signal_data = np.zeros([1], dtype=np.int32)
+        self.engine_forward_signal = IPCSignal(
+            name="engine_forward_signal",
+            array=engine_forward_signal_data,
+            dtype=np.int32,
+            suffix=self.parallel_config.local_engine_worker_queue_port,
+            create=False,
+        )
+
     def update_weights_from_tensor(self, mmap_infos):
         """
         update_weights_from_tensor
@@ -516,7 +528,9 @@ class PaddleDisWorkerProc:
 
             if self.exist_task_signal.value[0] == ExistTaskStatus.EXIST or self.task_queue.read_finish_flag.get() == 1:
                 logger.info(f"Rank: {self.local_rank} Detected new requests.")
-
+                # Signal engine that a forward pass is beginning so the scheduling
+                # loop waits and accumulates more requests into the waiting queue.
+                self.engine_forward_signal.value[0] = 1
                 tasks, read_finish = self.task_queue.get_tasks()
                 # Only one of all tp_size client will get read_finish == True.
                 if read_finish:
@@ -561,7 +575,7 @@ class PaddleDisWorkerProc:
                 and (not self.enable_overlap_schedule)
             ):
                 self._tp_barrier_wait() if tp_size > 1 else None
-
+                self.engine_forward_signal.value[0] = 0
                 time.sleep(0.001)
                 continue
 
@@ -573,6 +587,8 @@ class PaddleDisWorkerProc:
             if not envs.ENABLE_V1_KVCACHE_SCHEDULER:
                 self.exist_prefill_task_signal.value[0] = self.worker.exist_prefill()
             logger.debug(f"execute model cost: {time.time()-start_execute_time:.5f} s")
+            # Forward pass complete: release the engine scheduling loop.
+            self.engine_forward_signal.value[0] = 0
 
     def initialize_kv_cache(self) -> None:
         """Profiles the peak memory usage of the model to determine how many

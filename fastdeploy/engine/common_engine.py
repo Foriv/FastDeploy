@@ -39,6 +39,7 @@ import zmq
 from tqdm import tqdm
 
 import fastdeploy.metrics.trace as tracing
+from fastdeploy import envs
 from fastdeploy.engine.request import (
     ControlRequest,
     ControlResponse,
@@ -308,6 +309,19 @@ class EngineService:
         self.exist_prefill_task_signal = IPCSignal(
             name="exist_prefill_task_signal",
             array=exist_prefill_task_signal_data,
+            dtype=np.int32,
+            suffix=current_suffix,
+            create=True,
+        )
+
+        # engine_forward_signal: set to 1 by worker when a forward pass begins,
+        # back to 0 when the forward pass completes. The scheduling loop waits for
+        # this signal to be 0 (forward done) before running the next schedule(),
+        # so that requests arriving during a forward are batched together.
+        engine_forward_signal_data = np.zeros([1], dtype=np.int32)
+        self.engine_forward_signal = IPCSignal(
+            name="engine_forward_signal",
+            array=engine_forward_signal_data,
             dtype=np.int32,
             suffix=current_suffix,
             create=True,
@@ -973,92 +987,205 @@ class EngineService:
                 self.llm_logger.error(f"fetching request error {e} {str(traceback.format_exc())}")
                 is_fetching = False
 
+        enable_overlap = self.cfg.scheduler_config.enable_overlap_schedule
+        # Overlap scheduling state: pre-scheduled batch waiting for GPU forward to finish.
+        # Mirrors SGLang's result_queue (depth-1 pipeline): CPU schedules batch N+1 while
+        # GPU executes batch N, then dispatches N+1 as soon as signal turns 0.
+        pending_tasks: list | None = None
+        pending_error_tasks: list | None = None
+        # Track whether the last dispatched batch contained prefill requests.
+        # Used to implement SGLang's "consecutive prefill" TTFT optimisation:
+        # when two back-to-back batches are both EXTEND, disable overlap so
+        # that the first prefill's output is returned to the client sooner.
+        last_batch_has_prefill: bool = False
+
+        def _has_prefill(task_list) -> bool:
+            from fastdeploy.engine.sched.resource_manager_v1 import RequestType as RT
+            return any(getattr(t, "task_type", None) == RT.PREFILL for t in task_list)
+
+        def _dispatch_tasks(task_list, err_list):
+            """Emit tracing spans and push tasks into the engine-worker queue."""
+            if task_list:
+                if self.cfg.scheduler_config.splitwise_role == "decode":
+                    for task in task_list:
+                        if task.task_type == RequestType.PREEMPTED:
+                            msg = f"{task.request_id} decode not enough blocks, need to be rescheduled."
+                            self.llm_logger.error(msg)
+                            self.scheduler.put_results(
+                                [
+                                    RequestOutput(
+                                        request_id=task.request_id,
+                                        finished=True,
+                                        error_code=500,
+                                        error_msg=msg,
+                                    )
+                                ]
+                            )
+                self.resource_manager.get_real_bsz()
+                for task in task_list:
+                    if task.task_type == RequestType.PREFILL:
+                        rid = task.request_id.split("_")[0]
+                        trace_carrier = task.trace_carrier
+                        tracing.trace_set_proc_propagate_context(rid, trace_carrier)
+                        trace_carrier = tracing.trace_get_proc_propagate_context(rid)
+                        task.trace_carrier = trace_carrier
+                        tracing.trace_report_span(
+                            tracing.TraceSpanName.SCHEDULE,
+                            rid,
+                            int(task.metrics.scheduler_recv_req_time * 1e9),
+                            int(time.time() * 1e9),
+                            thread_finish_flag=True,
+                        )
+                        trace_print(
+                            LoggingEventName.RESOURCE_ALLOCATE_END, task.request_id, getattr(task, "user", "")
+                        )
+                        trace_print(
+                            LoggingEventName.REQUEST_SCHEDULE_END, task.request_id, getattr(task, "user", "")
+                        )
+                        trace_print(LoggingEventName.INFERENCE_START, task.request_id, getattr(task, "user", ""))
+                    if isinstance(task, Request):
+                        if self.cfg.scheduler_config.splitwise_role == "decode":
+                            task.metrics.decode_inference_start_time = time.time()
+                        else:
+                            task.metrics.inference_start_time = time.time()
+                self.engine_worker_queue.put_tasks((task_list, self.resource_manager.real_bsz))
+            if err_list:
+                for request_id, failed in err_list:
+                    if failed is None:
+                        self.llm_logger.warning(
+                            f"Request {request_id} has no error, skip sending error response."
+                        )
+                        continue
+                    self._send_error_response(request_id, failed)
+
         while self.running:
             with self._pause_cond:
                 self._pause_cond.wait_for(lambda: not self.is_paused)
             try:
-                # SGLang-aligned: detect forward completion (same as in _schedule_request_to_worker)
-
-                if self.engine_worker_queue.exist_tasks():
-                    time.sleep(0.001)
-                    continue
-                if self.cfg.scheduler_config.splitwise_role != "mixed":
-                    if not is_fetching:
+                if not is_fetching:
+                    # Check if the thread pool is still available to avoid submitting tasks to a shutdown thread pool.
+                    try:
                         is_fetching = True
                         get_request_pool.submit(_fetch_request)
+                    except RuntimeError as e:
+                        if "shutdown" in str(e):
+                            self.llm_logger.info("Thread pool shutdown detected, exiting scheduler loop")
+                            break
+                        else:
+                            raise
+
+                if enable_overlap:
+                    # -------------------------------------------------------
+                    # Overlap scheduling loop (mirrors SGLang event_loop_overlap)
+                    #
+                    # Pipeline (depth-1):
+                    #   iter N  : schedule(N) while GPU is idle or running N-1
+                    #             → if GPU busy: stash as pending_tasks
+                    #             → if GPU idle: dispatch immediately
+                    #   iter N+1: GPU finishes N (signal→0) → dispatch pending(N)
+                    #             → immediately schedule(N+1) without waiting
+                    #
+                    # Consecutive-prefill exception (SGLang TTFT optimisation):
+                    #   If both current and last batch are EXTEND (prefill), we
+                    #   disable overlap: wait for forward to finish before
+                    #   scheduling, so the first prefill's TTFT is minimised.
+                    # -------------------------------------------------------
+
+                    # Phase 1: drain pending batch once forward is done
+                    if pending_tasks is not None:
+                        if self.engine_forward_signal.value[0] != 0:
+                            time.sleep(0.001)
+                            continue
+                        # Forward complete — dispatch the pre-scheduled batch
+                        _dispatch_tasks(pending_tasks, pending_error_tasks)
+                        last_batch_has_prefill = _has_prefill(pending_tasks)
+                        pending_tasks = None
+                        pending_error_tasks = None
+                        # Fall through immediately to schedule the next batch
+
+                    # Phase 2: wait until the worker has picked up current tasks
+                    if self.engine_worker_queue.num_tasks() != 0:
+                        time.sleep(0.001)
+                        continue
+
+                    # Phase 3: schedule next batch (CPU work)
+                    _sched_t0 = time.time()
+                    tasks, error_tasks = self.resource_manager.schedule()
+                    _sched_ms = (time.time() - _sched_t0) * 1000
+                    self.llm_logger.debug(f"schedule() cost: {_sched_ms:.2f}ms, tasks={len(tasks)}")
+
+                    if tasks:
+                        current_has_prefill = _has_prefill(tasks)
+                        # Disable overlap for two consecutive prefill batches to
+                        # improve TTFT of the first batch (SGLang strategy).
+                        disable_overlap_for_batch = (
+                            envs.FD_DISABLE_CONSECUTIVE_PREFILL_OVERLAP
+                            and last_batch_has_prefill
+                            and current_has_prefill
+                        )
+                        if self.engine_forward_signal.value[0] == 0 or disable_overlap_for_batch:
+                            # GPU is idle OR consecutive-prefill: dispatch now
+                            _dispatch_tasks(tasks, error_tasks)
+                            last_batch_has_prefill = current_has_prefill
+                        else:
+                            # GPU is busy executing previous batch — pre-schedule:
+                            # stash and dispatch when forward completes (next iter)
+                            pending_tasks = tasks
+                            pending_error_tasks = error_tasks
+                            last_batch_has_prefill = current_has_prefill
+                            self.llm_logger.debug(
+                                f"overlap: pre-scheduled {len(tasks)} tasks while GPU running"
+                            )
+                    elif error_tasks:
+                        for request_id, failed in error_tasks:
+                            if failed is None:
+                                self.llm_logger.warning(
+                                    f"Request {request_id} has no error, skip sending error response."
+                                )
+                                continue
+                            self._send_error_response(request_id, failed)
+                    else:
+                        # No tasks: send empty batch to EP workers so their barrier doesn't hang.
+                        if self.cfg.parallel_config.enable_expert_parallel:
+                            self.engine_worker_queue.put_tasks(
+                                ([], self.resource_manager.real_bsz)
+                            )
+                        else:
+                            time.sleep(0.005)
 
                 else:
-                    if len(self.resource_manager.waiting) == 0 and (not is_fetching):
-                        # Check if the thread pool is still available to avoid submitting tasks to a shutdown thread pool.
-                        try:
-                            is_fetching = True
-                            get_request_pool.submit(_fetch_request)
-                        except RuntimeError as e:
-                            if "shutdown" in str(e):
-                                self.llm_logger.info("Thread pool shutdown detected, exiting scheduler loop")
-                                break
-                            else:
-                                raise
+                    # -------------------------------------------------------
+                    # Original non-overlap loop
+                    # Continue preprocessing incoming requests and accumulating
+                    # them in the queue when forward pass is not finished. Once
+                    # the forward pass finishes, these accumulated requests can
+                    # be scheduled in larger, more efficient batches.
+                    # -------------------------------------------------------
+                    if not (
+                        self.engine_worker_queue.num_tasks() == 0
+                        and self.engine_forward_signal.value[0] == 0
+                    ):
+                        time.sleep(0.001)
+                        continue
 
-                # 2. Schedule requests
-                tasks, error_tasks = self.resource_manager.schedule()
+                    # 2. Schedule requests
+                    _sched_t0 = time.time()
+                    tasks, error_tasks = self.resource_manager.schedule()
+                    _sched_ms = (time.time() - _sched_t0) * 1000
+                    self.llm_logger.debug(f"schedule() cost: {_sched_ms:.2f}ms, tasks={len(tasks)}")
 
-                # 3. Send to engine
-                if tasks:
-                    if self.cfg.scheduler_config.splitwise_role == "decode":
-                        for task in tasks:
-                            if task.task_type == RequestType.PREEMPTED:
-                                msg = f"{task.request_id} decode not enough blocks, need to be rescheduled."
-                                self.llm_logger.error(msg)
-                                self.scheduler.put_results(
-                                    [
-                                        RequestOutput(
-                                            request_id=task.request_id,
-                                            finished=True,
-                                            error_code=500,
-                                            error_msg=msg,
-                                        )
-                                    ]
-                                )
-                    self.resource_manager.get_real_bsz()
-                    for task in tasks:
-                        if task.task_type == RequestType.PREFILL:
-                            rid = task.request_id.split("_")[0]
-                            trace_carrier = task.trace_carrier
-                            tracing.trace_set_proc_propagate_context(rid, trace_carrier)
-                            trace_carrier = tracing.trace_get_proc_propagate_context(rid)
-                            task.trace_carrier = trace_carrier
-                            tracing.trace_report_span(
-                                tracing.TraceSpanName.SCHEDULE,
-                                rid,
-                                int(task.metrics.scheduler_recv_req_time * 1e9),
-                                int(time.time() * 1e9),
-                                thread_finish_flag=True,
-                            )
-                            trace_print(
-                                LoggingEventName.RESOURCE_ALLOCATE_END, task.request_id, getattr(task, "user", "")
-                            )
-                            trace_print(
-                                LoggingEventName.REQUEST_SCHEDULE_END, task.request_id, getattr(task, "user", "")
-                            )
-                            trace_print(LoggingEventName.INFERENCE_START, task.request_id, getattr(task, "user", ""))
-                        if isinstance(task, Request):
-                            if self.cfg.scheduler_config.splitwise_role == "decode":
-                                task.metrics.decode_inference_start_time = time.time()
-                            else:
-                                task.metrics.inference_start_time = time.time()
-                    self.engine_worker_queue.put_tasks((tasks, self.resource_manager.real_bsz))
+                    # 3. Send to engine
+                    _dispatch_tasks(tasks, error_tasks)
 
-                # 4. Response error tasks
-                if error_tasks:
-                    for request_id, failed in error_tasks:
-                        if failed is None:
-                            self.llm_logger.warning(f"Request {request_id} has no error, skip sending error response.")
-                            continue
-                        self._send_error_response(request_id, failed)
+                    # 4. EP idle batch
+                    if not tasks:
+                        if self.cfg.parallel_config.enable_expert_parallel:
+                            self.engine_worker_queue.put_tasks(
+                                ([], self.resource_manager.real_bsz)
+                            )  # Empty (as idle tasks for ep)
 
-                if not tasks and not error_tasks:
-                    time.sleep(0.005)
+                    if not tasks and not error_tasks:
+                        time.sleep(0.005)
 
             except RuntimeError as e:
                 if "cannot schedule new futures after shutdown" in str(e):

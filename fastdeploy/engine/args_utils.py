@@ -445,9 +445,12 @@ class EngineArgs:
     """
     SplitWise Use, Results Writer Batch Size
     """
-    enable_overlap_schedule: bool = False
+    enable_overlap_schedule: bool = True
     """
-    Flag to enable overlapping schedule. Default is False (disabled).
+    Flag to enable overlapping schedule. Default is True (enabled).
+    Mirrors SGLang's event_loop_overlap: the engine pre-schedules the next batch
+    while the GPU executes the current one, eliminating the scheduling gap.
+    Disable with --disable-overlap-schedule.
     """
     enable_priority_scheduling: bool = False
     """
@@ -1334,10 +1337,13 @@ class EngineArgs:
         )
 
         scheduler_group.add_argument(
-            "--enable-overlap-schedule",
-            action="store_true",
+            "--disable-overlap-schedule",
+            action="store_false",
+            dest="enable_overlap_schedule",
             default=EngineArgs.enable_overlap_schedule,
-            help="Enable overlapping schedule.",
+            help="Disable overlapping schedule (enabled by default). "
+            "When disabled, scheduling waits for each forward pass to complete "
+            "before scheduling the next batch.",
         )
         scheduler_group.add_argument(
             "--enable-priority-scheduling",
