@@ -1463,17 +1463,20 @@ class ResourceManagerV1(ResourceManager):
             # if not scheduled_reqs:
             #     self.reset_new_token_ratio_on_idle()
 
-            # SGLang-aligned: decay new_token_ratio only on pure decode rounds.
-            # In SGLang, decay happens inside update_running_batch(), which is only
-            # called when new_batch is None (no prefill this cycle). During mixed
-            # rounds (prefill + decode) SGLang does NOT decay. Mirror that here by
-            # gating on `not is_extend_mode`.
+            # SGLang-aligned: decay new_token_ratio only on pure decode rounds,
+            # and only when no preemption occurred this cycle.
+            # In SGLang update_running_batch(), retract and decay are mutually
+            # exclusive: if check_decode_mem() fails → retract_decode() sets
+            # new_token_ratio (upward); otherwise → normal decay. Mirroring
+            # that: skip decay when preempted_reqs is non-empty (ratio was
+            # already adjusted upward by _update_new_token_ratio_after_preemption).
             has_decode_requests = any(
                 req.num_computed_tokens >= req.need_prefill_tokens
                 for req in self.running
             )
             if (
                 not is_extend_mode
+                and not preempted_reqs
                 and has_decode_requests
                 and self.current_new_token_ratio > self.min_new_token_ratio
             ):
