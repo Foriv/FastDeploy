@@ -1038,10 +1038,14 @@ class ResourceManagerV1(ResourceManager):
                     block_size = self.config.cache_config.block_size
                     num_new_blocks_needed = 1 if (request.num_total_tokens - 1) % block_size == 0 else 0
 
-                    # SGLang-aligned: schedule decode task without threshold check
-                    # The pre-allocation is decoupled from scheduling
+                    # Only put decode tasks into scheduled_reqs when a new KV block must be
+                    # allocated (i.e. the current token lands on a block boundary).
+                    # For all other decode steps the worker-side `recover_decode_task` CUDA kernel
+                    # automatically increments seq_lens_decoder and updates is_block_step, so the
+                    # engine does NOT need to re-send these requests every step.
+                    # This matches fd (develop) behaviour and keeps put_tasks O(new-blocks) instead
+                    # of O(all-running), eliminating the dominant preprocess overhead at large bs.
                     if num_new_blocks_needed > 0:
-                        # Need to allocate new blocks, check if we can allocate
                         if self.cache_manager.can_allocate_gpu_blocks(num_new_blocks_needed):
                             llm_logger.debug(
                                 f"schedule decoding task: {request} request.num_total_tokens {request.num_total_tokens} request.num_computed_tokens {request.num_computed_tokens}"
@@ -1051,17 +1055,12 @@ class ResourceManagerV1(ResourceManager):
                                     num_new_blocks_needed, request.request_id
                                 )
                             )
-                            # Prepare decoding task
                             scheduled_reqs.append(self._prepare_decode_task(request))
                         else:
-                            # Not enough blocks: SGLang-aligned retract_decode
-                            # Evict prefix cache first, then kick decode requests one by one
-                            # (shortest output / longest input first) until memory is enough
                             can_schedule = self._trigger_preempt(
                                 request, num_new_blocks_needed, preempted_reqs, scheduled_reqs
                             )
                             if not can_schedule:
-                                # Only 1 decode request left and still OOM — skip, avoid hang
                                 llm_logger.warning(
                                     f"OOM for decode request {request.request_id} (idx={request.idx}) "
                                     f"even after retracting all other decode requests."
@@ -1075,11 +1074,8 @@ class ResourceManagerV1(ResourceManager):
                                 )
                             )
                             scheduled_reqs.append(self._prepare_decode_task(request))
-
-                    # No new blocks needed (num_new_blocks_needed == 0), but still schedule decode task
-                    # SGLang-aligned: decode does NOT consume token_budget, only checks memory
-                    else:
-                        scheduled_reqs.append(self._prepare_decode_task(request))
+                    # num_new_blocks_needed == 0: no block allocation needed, worker handles
+                    # seq_len update via recover_decode_task kernel — do NOT add to scheduled_reqs.
 
 
                     num_decoding_req_nums += 1
