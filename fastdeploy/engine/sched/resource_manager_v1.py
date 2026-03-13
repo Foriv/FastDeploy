@@ -313,46 +313,46 @@ class ResourceManagerV1(ResourceManager):
 
     def _trigger_preempt(self, request, num_new_blocks, preempted_reqs, scheduled_reqs):
         """
-        If the request cannot be scheduled, preempt running decode requests one by one until it can be scheduled.
-        Only preempt decode requests (num_computed_tokens >= need_prefill_tokens).
+        SGLang-aligned retract_decode: when a decode request cannot get enough blocks,
+        evict prefix cache first, then kick out other decode requests one by one
+        (shortest output / longest input first) until there is enough memory,
+        always keeping at least 1 request.
 
-        SGLang-aligned strategy:
-        - Sort by (output_len asc, input_len desc) to prioritize retracting short-output, long-input requests
-        - Keep at least 1 request in running
-        - After preemption, update current_new_token_ratio based on remaining requests
+        Mirrors SGLang's release_req flow:
+          _free_blocks(req)  →  evict remaining * RETRACT_DECODE_STEPS tokens  →  check again
         """
-        # Collect decode requests (num_computed_tokens >= need_prefill_tokens)
+        # Collect decode requests sorted: shorter output / longer input popped first
+        # (reverse=True so pop() removes the last element = shortest output)
         decode_requests = [
             req for req in self.running
             if req.num_computed_tokens >= req.need_prefill_tokens
         ]
-
-        # SGLang-aligned sort: prioritize retracting requests with shorter output
-        # If output_len is equal, prioritize retracting requests with longer input
         decode_requests.sort(
             key=lambda r: (len(r.output_token_ids), -r.prompt_token_ids_len),
-            reverse=True,  # pop from end: shorter output first
+            reverse=True,
         )
 
-        # If only 1 decode request, cannot preempt (need to keep at least 1)
-        # Return False to let scheduler handle this gracefully
+        # First: try evicting prefix cache only (SGLang's evict_from_tree_cache before retract loop)
+        self._evict_decode_kv_cache(len(decode_requests))
+        if self.cache_manager.can_allocate_gpu_blocks(num_new_blocks):
+            return True
+
+        # Need at least 2 decode requests to be able to kick one out
         if len(decode_requests) <= 1:
-            can_schedule = self.cache_manager.can_allocate_gpu_blocks(num_new_blocks)
-            return can_schedule
+            return False
 
         preempted_count = 0
-        remaining_req_count = len(decode_requests) - 1  # Count for KV eviction (decreases after each preempt)
-
-        for preempted_req in decode_requests[:-1]:  # Skip last one to keep at least 1
-            if self.cache_manager.can_allocate_gpu_blocks(num_new_blocks):
+        # SGLang while loop: kick one, re-check, until memory is enough or only 1 left
+        while not self.cache_manager.can_allocate_gpu_blocks(num_new_blocks):
+            if len(decode_requests) <= 1:
                 break
 
-            # Remove from running list
+            preempted_req = decode_requests.pop()  # shortest output first
+
+            # Remove from running list and release KV (sync, FD style via _free_blocks)
             self.running.remove(preempted_req)
             preempted_req.status = RequestStatus.PREEMPTED
             preempted_req.num_computed_tokens = 0
-
-            # Mark as retracted for SGLang alignment
             preempted_req.is_retracted = True
 
             if self.config.scheduler_config.splitwise_role == "decode":
@@ -363,37 +363,30 @@ class ResourceManagerV1(ResourceManager):
                 if preempted_req.request_id in self.req_dict:
                     del self.req_dict[preempted_req.request_id]
                 self._free_blocks(preempted_req)
-                llm_logger.info(f"Preemption is triggered! Preempted request id: {preempted_req.request_id}")
             else:
                 self._free_blocks(preempted_req)
                 preempted_req.num_cached_blocks = 0
                 self.to_be_rescheduled_request_id_set.add(preempted_req.request_id)
-                llm_logger.info(f"Preemption is triggered! Preempted request id: {preempted_req.request_id}")
 
             preempted_reqs.append(preempted_req)
             scheduled_reqs.append(self._prepare_preempt_task(preempted_req))
             preempted_count += 1
 
-            # Evict KV cache from tree (SGLang-aligned: retract_decode_steps * remaining_req_count)
-            self._evict_decode_kv_cache(remaining_req_count)
-            remaining_req_count -= 1
-
-            llm_logger.debug(
-                f"preempt {preempted_req.request_id} in idx {preempted_req.idx} "
-                f"with output_len={len(preempted_req.output_token_ids)}, "
-                f"input_len={preempted_req.prompt_token_ids_len}"
+            llm_logger.info(
+                f"Preemption triggered: {preempted_req.request_id} "
+                f"(output_len={len(preempted_req.output_token_ids)}, "
+                f"input_len={preempted_req.prompt_token_ids_len})"
             )
+
+            # SGLang: after each retraction evict remaining * RETRACT_DECODE_STEPS tokens
+            self._evict_decode_kv_cache(len(decode_requests))
 
         if preempted_count > 0:
             llm_logger.debug(self.info())
             self._info_each_block()
-
-            # Update new_token_ratio based on remaining requests (SGLang style)
             self._update_new_token_ratio_after_preemption()
 
-        # Check if we can schedule now
-        can_schedule = self.cache_manager.can_allocate_gpu_blocks(num_new_blocks)
-        return can_schedule
+        return self.cache_manager.can_allocate_gpu_blocks(num_new_blocks)
 
     def _evict_decode_kv_cache(self, remaining_req_count: int):
         """
@@ -488,8 +481,8 @@ class ResourceManagerV1(ResourceManager):
             total_decoded_tokens + retract_decode_steps * num_decode_reqs
         ) / (total_max_new_tokens + 1)
 
-        # Clamp to [min_ratio, init_ratio]
-        new_ratio = max(self.min_new_token_ratio, min(self.init_new_token_ratio, new_ratio))
+        # SGLang-aligned: clamp to [min_ratio, 1.0] (SGLang uses min(1.0, ...), not init_ratio)
+        new_ratio = max(self.min_new_token_ratio, min(1.0, new_ratio))
 
         llm_logger.debug(
             f"Update new_token_ratio after preemption: "
@@ -995,6 +988,11 @@ class ResourceManagerV1(ResourceManager):
             )
             token_budget = self.config.scheduler_config.max_num_batched_tokens - running_decode_count
 
+            # Track whether any prefill/extend request was actually scheduled this round.
+            # Used for decay condition: SGLang only decays new_token_ratio when
+            # update_running_batch() is reached, i.e. no prefill batch was scheduled.
+            has_scheduled_prefill = False
+
             # SGLang-aligned: chunked_prefill_size is per-request limit, token_budget is batch limit
             chunked_prefill_size = self.config.scheduler_config.chunked_prefill_size
 
@@ -1056,45 +1054,27 @@ class ResourceManagerV1(ResourceManager):
                             # Prepare decoding task
                             scheduled_reqs.append(self._prepare_decode_task(request))
                         else:
-                            # Not enough blocks, trigger preemption
-                            # SGLang-aligned: first try to evict decode KV cache
-                            self._evict_decode_kv_cache(len(self.running))
+                            # Not enough blocks: SGLang-aligned retract_decode
+                            # Evict prefix cache first, then kick decode requests one by one
+                            # (shortest output / longest input first) until memory is enough
+                            can_schedule = self._trigger_preempt(
+                                request, num_new_blocks_needed, preempted_reqs, scheduled_reqs
+                            )
+                            if not can_schedule:
+                                # Only 1 decode request left and still OOM — skip, avoid hang
+                                llm_logger.warning(
+                                    f"OOM for decode request {request.request_id} (idx={request.idx}) "
+                                    f"even after retracting all other decode requests."
+                                )
+                                req_index += 1
+                                continue
 
-                            # Check again after eviction
-                            if self.cache_manager.can_allocate_gpu_blocks(num_new_blocks_needed):
-                                request.block_tables.extend(
-                                    self.cache_manager.allocate_gpu_blocks(
-                                        num_new_blocks_needed, request.request_id
-                                    )
+                            request.block_tables.extend(
+                                self.cache_manager.allocate_gpu_blocks(
+                                    num_new_blocks_needed, request.request_id
                                 )
-                                scheduled_reqs.append(self._prepare_decode_task(request))
-                            else:
-                                # Cannot allocate even after preemption, use SGLang-aligned behavior
-                                # Try to preempt other requests
-                                can_schedule = self._trigger_preempt(
-                                    request, num_new_blocks_needed, preempted_reqs, scheduled_reqs
-                                )
-                                if not can_schedule:
-                                    # Cannot preempt (e.g., only 1 decode request left),
-                                    # skip this request and continue to avoid system hang
-                                    llm_logger.warning(
-                                        f"Cannot allocate {num_new_blocks_needed} blocks "
-                                        f"for decode request {request.request_id} (idx={request.idx}) "
-                                        f"even after preemption attempt. Request will wait for more resources."
-                                    )
-                                    # Do NOT schedule this request - it will wait in the queue
-                                    # NOTE: Do NOT consume token_budget either, decode only needs memory allocation
-                                    req_index += 1
-                                    continue
-
-                                # Allocation for next decoding blocks after preemption
-                                request.block_tables.extend(
-                                    self.cache_manager.allocate_gpu_blocks(
-                                        num_new_blocks_needed, request.request_id
-                                    )
-                                )
-                                # Prepare decoding task
-                                scheduled_reqs.append(self._prepare_decode_task(request))
+                            )
+                            scheduled_reqs.append(self._prepare_decode_task(request))
 
                     # No new blocks needed (num_new_blocks_needed == 0), but still schedule decode task
                     # SGLang-aligned: decode does NOT consume token_budget, only checks memory
@@ -1188,6 +1168,7 @@ class ResourceManagerV1(ResourceManager):
                         )
                         # Prepare prefill task
                         scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
+                        has_scheduled_prefill = True
                     else:  # Not enough blocks to allocate, trigger preemption
                         if self.config.scheduler_config.enable_priority_scheduling:
                             can_schedule = self._trigger_preempt(request, num_new_block, preempted_reqs, scheduled_reqs)
@@ -1200,6 +1181,7 @@ class ResourceManagerV1(ResourceManager):
                         )
                         # Prepare prefill task
                         scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
+                        has_scheduled_prefill = True
                     # SGLang-aligned: running chunked prefill also consumes token_budget.
                     # Deduct ceil-aligned token count so the budget matches actual block
                     # allocation granularity, preventing over-scheduling (SGLang:
@@ -1217,7 +1199,8 @@ class ResourceManagerV1(ResourceManager):
             # - Already-running prefill/decode requests: Already accounted for in previous cycles
             # - This cycle's new decode requests: Only those that will be created from waiting queue
             # SGLang non-mixed: waiting queue is only processed in EXTEND mode
-            if not preempted_reqs and is_extend_mode:
+            # SGLang-aligned: preemption does NOT block waiting queue scheduling
+            if is_extend_mode:
                 # SGLang-aligned: compute running decode reservation once per schedule() call,
                 # mirroring PrefillAdder.__init__ which sums _get_running_request_total_token_offset
                 # for all running_batch.reqs once. Avoids repeated O(N_running) iteration per
@@ -1305,6 +1288,7 @@ class ResourceManagerV1(ResourceManager):
                         self.waiting.popleft()
                         self.running.append(request)
                         scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
+                        has_scheduled_prefill = True
 
                         # If this is the last chunk, accumulate exact decode reservation:
                         # SGLang: min(max_new_tokens - len(output_ids), CLIP) * ratio
@@ -1389,6 +1373,7 @@ class ResourceManagerV1(ResourceManager):
                         self.waiting.popleft()
                         self.running.append(request)
                         scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
+                        has_scheduled_prefill = True
 
                         # If this is the last chunk, accumulate exact decode reservation:
                         # SGLang: min(max_new_tokens - len(output_ids), CLIP) * ratio
@@ -1477,19 +1462,18 @@ class ResourceManagerV1(ResourceManager):
             # if not scheduled_reqs:
             #     self.reset_new_token_ratio_on_idle()
 
-            # SGLang-aligned: decay new_token_ratio only on pure decode rounds,
-            # and only when no preemption occurred this cycle.
-            # In SGLang update_running_batch(), retract and decay are mutually
-            # exclusive: if check_decode_mem() fails → retract_decode() sets
-            # new_token_ratio (upward); otherwise → normal decay. Mirroring
-            # that: skip decay when preempted_reqs is non-empty (ratio was
-            # already adjusted upward by _update_new_token_ratio_after_preemption).
+            # SGLang-aligned: decay new_token_ratio only when no prefill was actually scheduled
+            # this round. In SGLang, update_running_batch() (which contains the decay) is only
+            # called when get_new_batch_prefill() returns None, i.e. no prefill batch was built.
+            # Using has_scheduled_prefill is more accurate than is_extend_mode, because
+            # is_extend_mode=True whenever waiting is non-empty, even if all waiting requests
+            # were blocked by OOM and nothing was actually scheduled.
             has_decode_requests = any(
                 req.num_computed_tokens >= req.need_prefill_tokens
                 for req in self.running
             )
             if (
-                not is_extend_mode
+                not has_scheduled_prefill
                 and not preempted_reqs
                 and has_decode_requests
                 and self.current_new_token_ratio > self.min_new_token_ratio
