@@ -586,7 +586,10 @@ class PaddleDisWorkerProc:
             # Only v0 use this signal
             if not envs.ENABLE_V1_KVCACHE_SCHEDULER:
                 self.exist_prefill_task_signal.value[0] = self.worker.exist_prefill()
-            logger.debug(f"execute model cost: {time.time()-start_execute_time:.5f} s")
+            execute_ms = (time.time() - start_execute_time) * 1000
+            _bs = len(req_dicts) if req_dicts is not None else 0
+            _prefill = sum(1 for r in req_dicts if r.task_type == RequestType.PREFILL) if req_dicts else 0
+            logger.info(f"execute_model cost: {execute_ms:.2f} ms, bs={_bs}, prefill={_prefill}")
             # Forward pass complete: release the engine scheduling loop.
             self.engine_forward_signal.value[0] = 0
 
