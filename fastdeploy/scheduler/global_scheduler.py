@@ -521,8 +521,6 @@ class GlobalScheduler:
                     f"Scheduler {self.name} has stolen a request from another scheduler. (name={scheduler_name})"
                 )
 
-        long_partial_requests = 0
-        short_partial_requests = 0
         required_total_blocks = 0
         current_prefill_tokens = 0
         remaining_request: List[Tuple[str, bytes]] = []
@@ -544,15 +542,11 @@ class GlobalScheduler:
 
             if not envs.FD_ENABLE_MAX_PREFILL:
                 if self.enable_chunked_prefill:
-                    if request.prompt_tokens_ids_len > self.long_prefill_token_threshold:
-                        long_partial_requests += 1
-                        if long_partial_requests > self.max_long_partial_prefills:
-                            remaining_request.append((request_queue_name, serialized_request))
-                            continue
-                    else:
-                        short_partial_requests += 1
-
-                    if short_partial_requests + long_partial_requests > self.max_num_partial_prefills:
+                    # SGLang-aligned: in chunked prefill mode, control by token budget rather than
+                    # a hard request count limit. Allow multiple new requests per scheduling round
+                    # as long as total tokens fit within max_num_batched_tokens, mirroring SGLang's
+                    # behavior of batching 8-22 new requests per prefill batch.
+                    if current_prefill_tokens > max_num_batched_tokens and len(scheduled_requests) > 0:
                         remaining_request.append((request_queue_name, serialized_request))
                         continue
                 else:

@@ -832,7 +832,6 @@ class InferScheduler:
         reqs = []
         required_blocks = 0
         current_prefill_tokens = 0
-        long_partial_requests, short_partial_requests = 0, 0
         cur_time = time.time()
         for i in range(batch):
             try:
@@ -852,16 +851,9 @@ class InferScheduler:
                     return reqs
 
                 if self.config.enable_chunked_prefill:
-                    if req.prompt_token_ids_len > self.config.long_prefill_token_threshold:
-                        # long partial requests
-                        long_partial_requests += 1
-                        if long_partial_requests > self.config.max_long_partial_prefills:
-                            self.reqs_queue.appendleft(req)
-                            break
-                    else:
-                        short_partial_requests += 1
-
-                    if short_partial_requests + long_partial_requests > self.config.max_num_partial_prefills:
+                    # SGLang-aligned: in chunked prefill mode, control by token budget rather than
+                    # a hard request count limit, allowing multiple new requests per scheduling round.
+                    if current_prefill_tokens > max_num_batched_tokens and len(reqs) > 0:
                         self.reqs_queue.appendleft(req)
                         break
                 else:

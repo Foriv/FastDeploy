@@ -1757,9 +1757,8 @@ class FDConfig:
         if envs.FD_FOR_TORCH_MODEL_FORMAT:
             self.model_config.model_format = "torch"
 
-        # TODO
         if not envs.FD_ENABLE_MAX_PREFILL:
-            self.max_prefill_batch = int(os.getenv("MAX_PREFILL_NUM", "3"))
+            self.max_prefill_batch = int(os.getenv("MAX_PREFILL_NUM", "32"))
             if (
                 int(envs.ENABLE_V1_KVCACHE_SCHEDULER) == 0
                 and self.model_config is not None
