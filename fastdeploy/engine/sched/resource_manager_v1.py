@@ -980,12 +980,20 @@ class ResourceManagerV1(ResourceManager):
             preempted_reqs: list[Request] = []
             error_reqs: list[tuple[str, str]] = []
 
+            # Single-pass over self.running: compute running_decode_count, has_running_prefill,
+            # and has_decode_requests in one loop instead of three separate O(N) scans.
+            running_decode_count = 0
+            has_running_prefill = False
+            has_decode_requests = False
+            for _r in self.running:
+                if _r.num_computed_tokens >= _r.need_prefill_tokens:
+                    running_decode_count += 1
+                    has_decode_requests = True
+                else:
+                    has_running_prefill = True
+
             # Initialize token_budget for this schedule call
             # SGLang mixed_chunk: subtract running_bs (one token per decode req) from budget
-            running_decode_count = sum(
-                1 for r in self.running
-                if r.num_computed_tokens >= r.need_prefill_tokens
-            )
             token_budget = self.config.scheduler_config.max_num_batched_tokens - running_decode_count
 
             # Track whether any prefill/extend request was actually scheduled this round.
@@ -1000,10 +1008,6 @@ class ResourceManagerV1(ResourceManager):
             # EXTEND (prefill) takes priority over DECODE, mirroring get_next_batch_to_run():
             #   1. If any request needs prefill (running chunked or new waiting) → EXTEND batch
             #   2. Otherwise → DECODE batch on running_batch
-            has_running_prefill = any(
-                r.num_computed_tokens < r.need_prefill_tokens
-                for r in self.running
-            )
             is_extend_mode = has_running_prefill or bool(self.waiting)
             llm_logger.debug(
                 f"SGLang batch type: {'EXTEND' if is_extend_mode else 'DECODE'} "
@@ -1464,10 +1468,7 @@ class ResourceManagerV1(ResourceManager):
             # Using has_scheduled_prefill is more accurate than is_extend_mode, because
             # is_extend_mode=True whenever waiting is non-empty, even if all waiting requests
             # were blocked by OOM and nothing was actually scheduled.
-            has_decode_requests = any(
-                req.num_computed_tokens >= req.need_prefill_tokens
-                for req in self.running
-            )
+            # has_decode_requests is pre-computed at the top of schedule() in the single-pass loop.
             if (
                 not has_scheduled_prefill
                 and not preempted_reqs
