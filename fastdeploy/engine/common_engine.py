@@ -767,10 +767,12 @@ class EngineService:
                     time.sleep(0.001)
                     continue
 
-                num_prefill_batch = min(
-                    int(self.resource_manager.available_batch()),
-                    self.cfg.max_prefill_batch,
-                )
+                # SGLang-aligned: max_prefill_batch default is None (unlimited)
+                available = int(self.resource_manager.available_batch())
+                if self.cfg.max_prefill_batch is not None:
+                    num_prefill_batch = min(available, self.cfg.max_prefill_batch)
+                else:
+                    num_prefill_batch = available
 
                 self.resource_manager.check_and_free_block_tables()
                 tasks = self.scheduler.get_requests(
@@ -824,10 +826,12 @@ class EngineService:
                 with self._pause_cond:
                     self._pause_cond.wait_for(lambda: not self.is_paused)
                 nonlocal is_fetching
-                num_prefill_batch = min(
-                    int(self.resource_manager.available_batch()),
-                    self.cfg.max_prefill_batch,
-                )
+                # SGLang-aligned: max_prefill_batch default is None (unlimited)
+                available = int(self.resource_manager.available_batch())
+                if self.cfg.max_prefill_batch is not None:
+                    num_prefill_batch = min(available, self.cfg.max_prefill_batch)
+                else:
+                    num_prefill_batch = available
 
                 if self.cfg.scheduler_config.splitwise_role != "mixed":
                     max_num_batched_tokens = self.cfg.scheduler_config.max_num_batched_tokens
