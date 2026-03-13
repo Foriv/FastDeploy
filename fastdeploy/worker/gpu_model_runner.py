@@ -707,6 +707,16 @@ class GPUModelRunner(ModelRunnerBase):
         batch_pooling_params = []
         self.share_inputs["num_running_requests"] = num_running_requests
         self.share_inputs["running_requests_ids"] = range(num_running_requests)
+
+        # SGLang-aligned fast path: collect decode-only requests for batch update.
+        # Sampling params and other static fields were already written at prefill time and
+        # do NOT change during decode — only block_tables need updating (new KV slot appended).
+        # Batch all decode block_table writes into a single vectorized numpy assignment
+        # instead of per-request scalar writes, matching SGLang's alloc_for_decode approach.
+        decode_idxs = []
+        decode_block_tables = []
+        preempt_pairs = []  # list of (idx, request) for preempted tasks
+
         for i in range(req_len):
             request = req_dicts[i]
             idx = self.share_inputs.get_index_by_batch_id(request.idx)
@@ -714,6 +724,29 @@ class GPUModelRunner(ModelRunnerBase):
 
             if hasattr(request, "pooling_params") and request.pooling_params is not None:
                 batch_pooling_params.append(request.pooling_params)
+
+            if request.task_type.value == RequestType.DECODE.value:
+                # Decode fast path: only block_tables changes, everything else is stable.
+                decode_idxs.append(idx)
+                decode_block_tables.append(request.block_tables)
+                if self.share_inputs["is_block_step"][idx]:
+                    has_decode_task = True
+                continue
+            elif request.task_type.value == RequestType.PREEMPTED.value:
+                preempt_pairs.append((idx, request))
+                continue
+
+        # Batch-write all decode block_tables at once (vectorized, SGLang-aligned)
+        if decode_idxs:
+            self._batch_update_decode_block_tables(decode_idxs, decode_block_tables)
+
+        # Batch-write preempted slots (idx and request already resolved above)
+        if preempt_pairs:
+            self._batch_update_preempted(preempt_pairs)
+
+        for i in range(req_len):
+            request = req_dicts[i]
+            idx = self.share_inputs.get_index_by_batch_id(request.idx)
 
             logits_info = None
             prefill_tokens = []
@@ -805,36 +838,11 @@ class GPUModelRunner(ModelRunnerBase):
                 ):  # In PD, we continue to decode after P generate first token
                     self.share_inputs["seq_lens_encoder"][idx : idx + 1] = 0
                     self.exist_prefill_flag = False
-            elif request.task_type.value == RequestType.DECODE.value:  # decode task
-                logger.debug(f"Handle decode request {request} at idx {idx}")
-                encoder_block_num = len(request.block_tables)
-                self.share_inputs["encoder_block_lens"][idx : idx + 1] = encoder_block_num
-                self.share_inputs["block_tables"][idx : idx + 1, :] = -1
-                self.share_inputs["block_tables"][idx : idx + 1, :encoder_block_num] = np.array(
-                    request.block_tables, dtype="int32"
-                )
-                if self.share_inputs["is_block_step"][idx]:  # has tasks to continue to decode
-                    has_decode_task = True
-                self.share_inputs["preempted_idx"][idx : idx + 1, :] = 0
+            elif request.task_type.value == RequestType.DECODE.value:
+                # Already handled in the batch fast path above; skip the slow per-request code.
                 continue
-            else:  # preempted task
-                logger.info(f"Handle preempted request {request} at idx {idx}")
-                self.share_inputs["preempted_idx"][idx : idx + 1, :] = 1
-                self.share_inputs["block_tables"][idx : idx + 1, :] = -1
-                self.share_inputs["stop_flags"][idx : idx + 1] = True
-                self.share_inputs["seq_lens_this_time_buffer"][idx : idx + 1] = 0
-                self.share_inputs["seq_lens_decoder"][idx : idx + 1] = 0
-                self.share_inputs["seq_lens_encoder"][idx : idx + 1] = 0
-                self.exist_prefill_flag = False
-                self.share_inputs["is_block_step"][idx : idx + 1] = False
-                self.prompt_logprobs_reqs.pop(request.request_id, None)
-                self.in_progress_prompt_logprobs.pop(request.request_id, None)
-                self.forward_batch_reqs_list[idx] = None
-
-                # Routing Replay
-                if self.fd_config.routing_replay_config.enable_routing_replay:
-                    self.routing_replay_manager.clear_request(batch_id=idx)
-
+            elif request.task_type.value == RequestType.PREEMPTED.value:
+                # Already handled in the batch fast path above; skip the slow per-request code.
                 continue
 
             assert len(request.eos_token_ids) == self.model_config.eos_tokens_lens
@@ -900,6 +908,79 @@ class GPUModelRunner(ModelRunnerBase):
         self.share_inputs["seq_lens_this_time"] = self.share_inputs["seq_lens_this_time_buffer"][:num_running_requests]
         if self.speculative_method in ["mtp"]:
             self.proposer.insert_tasks_v1(req_dicts, num_running_requests)
+
+    def _batch_update_decode_block_tables(self, idxs: list, block_tables_list: list):
+        """
+        SGLang-aligned: batch-update block_tables for all decode requests in one pass.
+
+        In the original per-request loop each decode request wrote:
+            share_inputs["block_tables"][idx:idx+1, :] = -1          # full-row clear
+            share_inputs["block_tables"][idx:idx+1, :N] = np.array(block_tables)  # write N blocks
+
+        For large batches (bs~200) this becomes the dominant preprocess overhead because
+        numpy shared-memory slice writes are serialized per-request.
+
+        SGLang avoids this by keeping req_to_token persistent and only appending the ONE new
+        KV slot allocated each decode step (alloc_for_decode writes a single indexed element).
+
+        FD's block_tables are written from the scheduler every step.  We cannot skip the write
+        entirely, but we can collapse the N per-request writes into two bulk numpy operations:
+          1. Clear the entire [bs, max_blocks] sub-array to -1 in a single slice.
+          2. For each request fill only its valid blocks using row-wise numpy fancy indexing.
+
+        This reduces Python/numpy overhead from O(bs * num_fields) to O(1) bulk operations.
+        """
+        if not idxs:
+            return
+
+        max_block_len = self.share_inputs["block_tables"].shape[1]
+
+        # Collect idx and block_tables into numpy arrays for bulk write.
+        idx_arr = np.array(idxs, dtype=np.int32)
+
+        # Step 1: clear all rows at once (single numpy slice — O(1) Python overhead)
+        self.share_inputs["block_tables"][idx_arr, :] = -1
+        self.share_inputs["preempted_idx"][idx_arr, :] = 0
+
+        # Step 2: write valid blocks row by row, but avoid the per-row -1 fill overhead.
+        # Group by block_table length to further reduce loop iterations when many requests
+        # have the same number of blocks (common in steady-state decode).
+        encoder_block_lens = []
+        for local_i, (idx, bt) in enumerate(zip(idxs, block_tables_list)):
+            n = len(bt)
+            encoder_block_lens.append(n)
+            if n > 0:
+                self.share_inputs["block_tables"][idx, :n] = np.asarray(bt, dtype=np.int32)
+
+        # Batch-write encoder_block_lens
+        self.share_inputs["encoder_block_lens"][idx_arr] = np.array(encoder_block_lens, dtype=np.int32)
+
+    def _batch_update_preempted(self, preempt_pairs: list):
+        """
+        SGLang-aligned: batch-update all preempted-request slots in one pass.
+        Args:
+            preempt_pairs: list of (idx, request) tuples, idx already resolved by caller.
+        """
+        if not preempt_pairs:
+            return
+
+        idx_arr = np.array([idx for idx, _ in preempt_pairs], dtype=np.int32)
+        self.share_inputs["preempted_idx"][idx_arr, :] = 1
+        self.share_inputs["block_tables"][idx_arr, :] = -1
+        self.share_inputs["stop_flags"][idx_arr] = True
+        self.share_inputs["seq_lens_this_time_buffer"][idx_arr] = 0
+        self.share_inputs["seq_lens_decoder"][idx_arr] = 0
+        self.share_inputs["seq_lens_encoder"][idx_arr] = 0
+        self.share_inputs["is_block_step"][idx_arr] = False
+
+        self.exist_prefill_flag = False
+        for idx, req in preempt_pairs:
+            self.forward_batch_reqs_list[idx] = None
+            self.prompt_logprobs_reqs.pop(req.request_id, None)
+            self.in_progress_prompt_logprobs.pop(req.request_id, None)
+            if self.fd_config.routing_replay_config.enable_routing_replay:
+                self.routing_replay_manager.clear_request(batch_id=idx)
+            logger.info(f"Handle preempted request {req} at idx {idx}")
 
     def insert_prefill_inputs(self, req_dicts: List[Request], num_running_requests: int = None):
         """
