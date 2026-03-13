@@ -81,6 +81,7 @@ class SplitWiseSchedulerConfig:
 
         self.max_model_len = kwargs.get("max_model_len")
         self.enable_chunked_prefill = kwargs.get("enable_chunked_prefill")
+        self.chunked_prefill_size = kwargs.get("chunked_prefill_size", 8192)
         self.max_num_partial_prefills = kwargs.get("max_num_partial_prefills")
         self.max_long_partial_prefills = kwargs.get("max_long_partial_prefills")
         self.long_prefill_token_threshold = kwargs.get("long_prefill_token_threshold")
@@ -852,8 +853,10 @@ class InferScheduler:
 
                 if self.config.enable_chunked_prefill:
                     # SGLang-aligned: in chunked prefill mode, control by token budget rather than
-                    # a hard request count limit, allowing multiple new requests per scheduling round.
-                    if current_prefill_tokens > max_num_batched_tokens and len(reqs) > 0:
+                    # a hard request count limit. Use chunked_prefill_size (single-request chunk cap)
+                    # as the per-batch token budget to avoid using max_num_batched_tokens which may
+                    # be set to max_model_len (131072) in v1 mixed mode.
+                    if current_prefill_tokens > self.config.chunked_prefill_size and len(reqs) > 0:
                         self.reqs_queue.appendleft(req)
                         break
                 else:

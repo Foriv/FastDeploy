@@ -54,6 +54,7 @@ class GlobalScheduler:
         min_load_score: float,
         load_shards_num: int,
         enable_chunked_prefill: bool,
+        chunked_prefill_size: int,
         max_num_partial_prefills: int,
         max_long_partial_prefills: int,
         long_prefill_token_threshold: int,
@@ -88,6 +89,7 @@ class GlobalScheduler:
         self.load_shards_num = load_shards_num
 
         self.enable_chunked_prefill = enable_chunked_prefill
+        self.chunked_prefill_size = chunked_prefill_size
         self.max_num_partial_prefills = max_num_partial_prefills
         self.max_long_partial_prefills = max_long_partial_prefills
         self.long_prefill_token_threshold = long_prefill_token_threshold
@@ -543,10 +545,11 @@ class GlobalScheduler:
             if not envs.FD_ENABLE_MAX_PREFILL:
                 if self.enable_chunked_prefill:
                     # SGLang-aligned: in chunked prefill mode, control by token budget rather than
-                    # a hard request count limit. Allow multiple new requests per scheduling round
-                    # as long as total tokens fit within max_num_batched_tokens, mirroring SGLang's
-                    # behavior of batching 8-22 new requests per prefill batch.
-                    if current_prefill_tokens > max_num_batched_tokens and len(scheduled_requests) > 0:
+                    # a hard request count limit. Use chunked_prefill_size (single-request chunk cap,
+                    # e.g. 8192) as the per-batch token budget, mirroring SGLang's rem_chunk_tokens
+                    # behavior. This avoids using max_num_batched_tokens which can be max_model_len
+                    # (131072) in v1 mixed mode, making the budget check ineffective.
+                    if current_prefill_tokens > self.chunked_prefill_size and len(scheduled_requests) > 0:
                         remaining_request.append((request_queue_name, serialized_request))
                         continue
                 else:

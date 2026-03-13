@@ -165,6 +165,7 @@ class GlobalSchedulerConfig:
         max_model_len: int = 8192,
         load_shards_num: int = 1,
         enable_chunked_prefill: bool = False,
+        chunked_prefill_size: int = 8192,
         max_num_partial_prefills: int = 1,
         max_long_partial_prefills: int = 1,
         long_prefill_token_threshold: int = 0,
@@ -204,6 +205,7 @@ class GlobalSchedulerConfig:
 
         self.max_model_len = max_model_len
         self.enable_chunked_prefill = enable_chunked_prefill
+        self.chunked_prefill_size = chunked_prefill_size
         self.max_num_partial_prefills = max_num_partial_prefills
         self.max_long_partial_prefills = max_long_partial_prefills
         self.long_prefill_token_threshold = long_prefill_token_threshold
@@ -331,6 +333,7 @@ class SchedulerConfig:
                 min_load_score=self.config.min_load_score,
                 load_shards_num=self.config.load_shards_num,
                 enable_chunked_prefill=self.config.enable_chunked_prefill,
+                chunked_prefill_size=self.config.chunked_prefill_size,
                 max_num_partial_prefills=self.config.max_num_partial_prefills,
                 max_long_partial_prefills=self.config.max_long_partial_prefills,
                 long_prefill_token_threshold=self.config.long_prefill_token_threshold,
