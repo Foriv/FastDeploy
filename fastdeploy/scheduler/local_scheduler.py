@@ -39,6 +39,7 @@ class LocalScheduler:
         max_size: int,
         ttl: int,
         enable_chunked_prefill: bool,
+        chunked_prefill_size: int,
         max_num_partial_prefills: int,
         max_long_partial_prefills: int,
         long_prefill_token_threshold: int,
@@ -70,6 +71,7 @@ class LocalScheduler:
         self.mutex = threading.Lock()
 
         self.enable_chunked_prefill = enable_chunked_prefill
+        self.chunked_prefill_size = chunked_prefill_size
         self.max_num_partial_prefills = max_num_partial_prefills
         self.max_long_partial_prefills = max_long_partial_prefills
         self.long_prefill_token_threshold = long_prefill_token_threshold
@@ -268,7 +270,6 @@ class LocalScheduler:
             requests: List[Request] = []
             required_total_blocks = 0
             current_prefill_tokens = 0
-            long_partial_requests, short_partial_requests = 0, 0
             for request_id in batch_ids:
                 request = self.requests[request_id]
                 required_input_blocks = self.calc_required_blocks(request.prompt_tokens_ids_len, block_size)
@@ -279,15 +280,9 @@ class LocalScheduler:
 
                 if not envs.FD_ENABLE_MAX_PREFILL:
                     if self.enable_chunked_prefill:
-                        if request.prompt_tokens_ids_len > self.long_prefill_token_threshold:
-                            # 长请求
-                            long_partial_requests += 1
-                            if long_partial_requests > self.max_long_partial_prefills:
-                                break
-                        else:
-                            short_partial_requests += 1
-
-                        if short_partial_requests + long_partial_requests > self.max_num_partial_prefills:
+                        # SGLang-aligned: use token budget (chunked_prefill_size) instead of a
+                        # hard request count limit, allowing multiple new requests per round.
+                        if current_prefill_tokens > self.chunked_prefill_size and len(requests) > 0:
                             break
                     else:
                         if current_prefill_tokens > max_num_batched_tokens and len(requests) > 0:

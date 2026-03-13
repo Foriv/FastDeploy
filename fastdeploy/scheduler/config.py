@@ -41,6 +41,7 @@ class LocalSchedulerConfig:
         ttl: int = 900,
         max_model_len: int = 8192,
         enable_chunked_prefill: bool = False,
+        chunked_prefill_size: int = 8192,
         max_num_partial_prefills: int = 1,
         max_long_partial_prefills: int = 1,
         long_prefill_token_threshold: int = 0,
@@ -54,6 +55,7 @@ class LocalSchedulerConfig:
             ttl: Time-to-live in seconds for request expiration (default 900s)
             max_model_len: Maximum model context length in tokens
             enable_chunked_prefill: Whether to enable chunked prefill processing
+            chunked_prefill_size: Per-batch token budget cap for chunked prefill (SGLang rem_chunk_tokens)
             max_num_partial_prefills: Max partial prefill operations allowed
             max_long_partial_prefills: Max long-running partial prefill ops
             long_prefill_token_threshold: Token count threshold for long prefill
@@ -68,6 +70,7 @@ class LocalSchedulerConfig:
 
         self.max_model_len = max_model_len
         self.enable_chunked_prefill = enable_chunked_prefill
+        self.chunked_prefill_size = chunked_prefill_size
         self.max_num_partial_prefills = max_num_partial_prefills
         self.max_long_partial_prefills = max_long_partial_prefills
         self.long_prefill_token_threshold = long_prefill_token_threshold
@@ -106,6 +109,7 @@ class DPLocalSchedulerConfig(LocalSchedulerConfig):
         ttl: int = 900,
         max_model_len: int = 8192,
         enable_chunked_prefill: bool = False,
+        chunked_prefill_size: int = 8192,
         max_num_partial_prefills: int = 1,
         max_long_partial_prefills: int = 1,
         long_prefill_token_threshold: int = 0,
@@ -119,6 +123,7 @@ class DPLocalSchedulerConfig(LocalSchedulerConfig):
             ttl: Time-to-live in seconds for request expiration (default 900s)
             max_model_len: Maximum model context length in tokens
             enable_chunked_prefill: Whether to enable chunked prefill processing
+            chunked_prefill_size: Per-batch token budget cap for chunked prefill
             max_num_partial_prefills: Max partial prefill operations allowed
             max_long_partial_prefills: Max long-running partial prefill ops
             long_prefill_token_threshold: Token count threshold for long prefill
@@ -132,6 +137,7 @@ class DPLocalSchedulerConfig(LocalSchedulerConfig):
 
         self.max_model_len = max_model_len
         self.enable_chunked_prefill = enable_chunked_prefill
+        self.chunked_prefill_size = chunked_prefill_size
         self.max_num_partial_prefills = max_num_partial_prefills
         self.max_long_partial_prefills = max_long_partial_prefills
         self.long_prefill_token_threshold = long_prefill_token_threshold
@@ -347,6 +353,7 @@ class SchedulerConfig:
                 max_size=self.config.max_size,
                 ttl=self.config.ttl,
                 enable_chunked_prefill=self.config.enable_chunked_prefill,
+                chunked_prefill_size=self.config.chunked_prefill_size,
                 max_num_partial_prefills=self.config.max_num_partial_prefills,
                 max_long_partial_prefills=self.config.max_long_partial_prefills,
                 long_prefill_token_threshold=self.config.long_prefill_token_threshold,
@@ -357,6 +364,7 @@ class SchedulerConfig:
             max_size=self.config.max_size,
             ttl=self.config.ttl,
             enable_chunked_prefill=self.config.enable_chunked_prefill,
+            chunked_prefill_size=self.config.chunked_prefill_size,
             max_num_partial_prefills=self.config.max_num_partial_prefills,
             max_long_partial_prefills=self.config.max_long_partial_prefills,
             long_prefill_token_threshold=self.config.long_prefill_token_threshold,
