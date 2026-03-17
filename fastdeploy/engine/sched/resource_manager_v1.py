@@ -1044,6 +1044,20 @@ class ResourceManagerV1(ResourceManager):
             # SGLang-aligned: chunked_prefill_size is per-request limit, token_budget is batch limit
             chunked_prefill_size = self.config.scheduler_config.chunked_prefill_size
 
+            # SGLang chunked_req singleton mechanism:
+            # rem_chunk_tokens is the per-step chunk token budget, initialized to chunked_prefill_size.
+            # Running chunked-prefill requests consume it first (mirroring add_chunked_req), and the
+            # waiting queue is blocked when it drops to 0 (mirroring budget_state() → OTHER).
+            # This ensures at most one chunk worth of tokens is spent on "in-flight" prefill per step,
+            # preventing the waiting loop from admitting new requests alongside running prefill and
+            # creating an N×8192 prefill batch that blocks decode for multiple consecutive steps.
+            #
+            # SGLang-aligned: in mixed_chunk mode, PrefillAdder.__init__ subtracts
+            # mixed_with_decode_tokens (= running_bs) from rem_chunk_tokens as well.
+            # Mirror this by subtracting running_decode_count from rem_chunk_tokens so that
+            # decode slots already in-flight reduce the chunk budget the same way SGLang does.
+            rem_chunk_tokens = max(0, chunked_prefill_size - running_decode_count)
+
             # SGLang non-mixed: decide batch type before scheduling
             # EXTEND (prefill) takes priority over DECODE, mirroring get_next_batch_to_run():
             #   1. If any request needs prefill (running chunked or new waiting) → EXTEND batch
@@ -1188,8 +1202,11 @@ class ResourceManagerV1(ResourceManager):
                     # SGLang-aligned: running chunked prefill consumes BOTH rem_chunk_tokens and
                     # rem_input_tokens (token_budget). In add_chunked_req, _update_prefill_budget
                     # is called which deducts extend_input_len from both budgets.
-                    # Here: min(chunked_prefill_size, token_budget) mirrors min(rem_chunk_tokens, rem_total_tokens)
-                    num_new_tokens = self._get_num_new_tokens(request, chunked_prefill_size, token_budget)
+                    # Here: min(chunked_prefill_size, rem_chunk_tokens, token_budget) mirrors
+                    # SGLang: _rem_tokens = min(rem_chunk_tokens, rem_total_tokens)
+                    num_new_tokens = self._get_num_new_tokens(
+                        request, min(chunked_prefill_size, rem_chunk_tokens), token_budget
+                    )
                     # SGLang: trunc_len <= 0 → AddReqResult.OTHER (skip this request for now)
                     if num_new_tokens <= 0:
                         req_index += 1
@@ -1216,11 +1233,12 @@ class ResourceManagerV1(ResourceManager):
                         # Prepare prefill task
                         scheduled_reqs.append(self._prepare_prefill_task(request, num_new_tokens))
                         has_scheduled_prefill = True
-                    # SGLang-aligned: running chunked prefill also consumes token_budget.
-                    # Deduct ceil-aligned token count so the budget matches actual block
-                    # allocation granularity, preventing over-scheduling (SGLang:
-                    # _update_prefill_budget uses ceil_paged_tokens before deducting).
+                    # SGLang-aligned: running chunked prefill also consumes token_budget and
+                    # rem_chunk_tokens. Deduct ceil-aligned token count so the budget matches
+                    # actual block allocation granularity (SGLang: _update_prefill_budget uses
+                    # ceil_paged_tokens before deducting rem_input_tokens and rem_chunk_tokens).
                     token_budget -= self._ceil_paged_tokens(num_new_tokens)
+                    rem_chunk_tokens -= self._ceil_paged_tokens(num_new_tokens)
                     request.num_computed_tokens += num_new_tokens
                     if self.config.cache_config.enable_prefix_caching:
                         self.cache_manager.update_cache_blocks(
@@ -1255,7 +1273,7 @@ class ResourceManagerV1(ResourceManager):
                 scheduled_new_prefill_remaining_blocks: int = 0
 
                 skip_requests: list[Request] = []
-                while self.waiting and token_budget > 0:
+                while self.waiting and token_budget > 0 and rem_chunk_tokens > 0:
                     if len(self.running) == self.max_num_seqs:
                         break
 
@@ -1299,7 +1317,12 @@ class ResourceManagerV1(ResourceManager):
                         ):
                             continue
                         # Allocate blocks for the tokens that does not hit cache
-                        num_new_tokens = self._get_num_new_tokens(request, chunked_prefill_size, token_budget)
+                        # SGLang-aligned: use min(chunked_prefill_size, rem_chunk_tokens) as per-request
+                        # limit, mirroring add_one_req where trunc_len = rem_chunk_tokens when
+                        # input_tokens > rem_chunk_tokens (the chunked-prefill branch).
+                        num_new_tokens = self._get_num_new_tokens(
+                            request, min(chunked_prefill_size, rem_chunk_tokens), token_budget
+                        )
                         num_new_block = self.get_new_block_nums(request, num_new_tokens)
 
                         # Check if this is the last chunk (will become decode after prefill completes)
@@ -1364,7 +1387,10 @@ class ResourceManagerV1(ResourceManager):
                         # Deduct ceil-aligned token count so the budget matches actual block
                         # allocation granularity (SGLang: ceil_paged_tokens before deducting
                         # rem_input_tokens in _update_prefill_budget).
+                        # SGLang-aligned: _update_prefill_budget also decrements rem_chunk_tokens
+                        # by the same amount. Mirror this so the waiting loop respects the chunk budget.
                         token_budget -= self._ceil_paged_tokens(num_new_tokens)
+                        rem_chunk_tokens -= self._ceil_paged_tokens(num_new_tokens)
                         request.num_computed_tokens += num_new_tokens
                         if self.config.cache_config.enable_prefix_caching:
                             self.cache_manager.update_cache_blocks(
@@ -1398,7 +1424,12 @@ class ResourceManagerV1(ResourceManager):
                                 break
 
                         # Allocate blocks for the tokens that does not hit cache
-                        num_new_tokens = self._get_num_new_tokens(request, chunked_prefill_size, token_budget)
+                        # SGLang-aligned: use min(chunked_prefill_size, rem_chunk_tokens) as per-request
+                        # limit, mirroring add_one_req where trunc_len = rem_chunk_tokens when
+                        # input_tokens > rem_chunk_tokens (the chunked-prefill branch).
+                        num_new_tokens = self._get_num_new_tokens(
+                            request, min(chunked_prefill_size, rem_chunk_tokens), token_budget
+                        )
                         num_new_block = self.get_new_block_nums(request, num_new_tokens)
 
                         # Check if this is the last chunk (will become decode after prefill completes)
@@ -1456,7 +1487,10 @@ class ResourceManagerV1(ResourceManager):
                         # Deduct ceil-aligned token count so the budget matches actual block
                         # allocation granularity (SGLang: ceil_paged_tokens before deducting
                         # rem_input_tokens in _update_prefill_budget).
+                        # SGLang-aligned: _update_prefill_budget also decrements rem_chunk_tokens
+                        # by the same amount. Mirror this so the waiting loop respects the chunk budget.
                         token_budget -= self._ceil_paged_tokens(num_new_tokens)
+                        rem_chunk_tokens -= self._ceil_paged_tokens(num_new_tokens)
                         request.num_computed_tokens += num_new_tokens
                         if self.config.cache_config.enable_prefix_caching:
                             self.cache_manager.update_cache_blocks(
@@ -1465,10 +1499,6 @@ class ResourceManagerV1(ResourceManager):
                         request.status = RequestStatus.RUNNING
                     else:
                         llm_logger.info(f"Unknown request status type:{request.status}, req_id:{request.request_id}")
-
-                for req in skip_requests:
-                    # move waiting request to end of the deque
-                    self.waiting.append(req)
 
             if scheduled_reqs:
                 llm_logger.debug(f"schedued_reqs: {scheduled_reqs}")
