@@ -1566,8 +1566,14 @@ class ResourceManagerV1(ResourceManager):
             # is_extend_mode=True whenever waiting is non-empty, even if all waiting requests
             # were blocked by OOM and nothing was actually scheduled.
             # has_decode_requests is pre-computed at the top of schedule() in the single-pass loop.
+            #
+            # Fix: also require scheduled_reqs to be non-empty. When the engine is "spinning"
+            # (worker consumed the last batch via get_tasks() but forward is still running on GPU),
+            # schedule() is called repeatedly every 5ms returning empty results. Without this guard,
+            # ratio decays ~10-40x per actual forward pass instead of once (as SGLang does).
             if (
-                not has_scheduled_prefill
+                scheduled_reqs
+                and not has_scheduled_prefill
                 and not preempted_reqs
                 and has_decode_requests
                 and self.current_new_token_ratio > self.min_new_token_ratio
