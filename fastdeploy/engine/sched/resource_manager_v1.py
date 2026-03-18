@@ -481,8 +481,15 @@ class ResourceManagerV1(ResourceManager):
             total_decoded_tokens + retract_decode_steps * num_decode_reqs
         ) / (total_max_new_tokens + 1)
 
-        # SGLang-aligned: clamp to [min_ratio, 1.0] (SGLang uses min(1.0, ...), not init_ratio)
-        new_ratio = max(self.min_new_token_ratio, min(1.0, new_ratio))
+        # SGLang-aligned: clamp to (0, 1.0] only, NO min_new_token_ratio floor.
+        # SGLang scheduler.py:2185 does: self.new_token_ratio = new_token_ratio (direct assign, no min clamp)
+        # Keeping ratio below min_new_token_ratio for exactly this one step is intentional:
+        # it makes rem_total_tokens appear larger, allowing evicted requests to be immediately
+        # re-admitted for re-prefill. On the next decode-only step, the normal decay path's
+        # max(..., min_new_token_ratio) will snap ratio back up to min_new_token_ratio automatically.
+        # If we clamp here to min_new_token_ratio (e.g. 0.098), evicted requests see a tight
+        # admission window, fail to re-enter, and trigger cascading preemptions.
+        new_ratio = min(1.0, max(new_ratio, 1e-6))
 
         llm_logger.debug(
             f"Update new_token_ratio after preemption: "
