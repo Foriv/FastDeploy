@@ -846,6 +846,13 @@ class EngineService:
                 else:
                     available_blocks = self.cfg.cache_config.max_block_num_per_seq
 
+                self.llm_logger.info(
+                    f"[FETCH] start: available_batch={available}, num_prefill_batch={num_prefill_batch}, "
+                    f"available_blocks={available_blocks}, max_prefill_batch={self.cfg.max_prefill_batch}, "
+                    f"waiting={len(self.resource_manager.waiting)}, "
+                    f"scheduler.unhandled={self.scheduler.get_unhandled_request_num()}"
+                )
+
                 tasks = self.scheduler.get_requests(
                     available_blocks=available_blocks,
                     block_size=self.cfg.cache_config.block_size,
@@ -858,6 +865,11 @@ class EngineService:
                     task.metrics.engine_get_req_time = time.time()
                     trace_print(LoggingEventName.REQUEST_QUEUE_END, task.request_id, getattr(task, "user", ""))
 
+                self.llm_logger.info(
+                    f"[FETCH] get_requests returned: {len(tasks)} tasks, "
+                    f"scheduler.unhandled={self.scheduler.get_unhandled_request_num()}"
+                )
+
                 if self.cfg.scheduler_config.splitwise_role == "decode":
                     # TODO: refine scheduler to remove this limitation
                     # Decode will process and schedule the request sent by prefill to engine,
@@ -866,8 +878,8 @@ class EngineService:
                     return
 
                 if tasks:
-                    self.llm_logger.debug(
-                        f"Engine has fetched tasks from {self.scheduler.__class__.__name__}: {[task.request_id for task in tasks]}"
+                    self.llm_logger.info(
+                        f"[FETCH] fetched task ids: {[task.request_id for task in tasks]}"
                     )
 
                 if self.cfg.scheduler_config.splitwise_role == "prefill":
@@ -986,6 +998,10 @@ class EngineService:
                     else:
                         for task in tasks:
                             self.resource_manager.add_request(task)
+                self.llm_logger.info(
+                    f"[FETCH] done: added {len(tasks)} tasks to waiting, "
+                    f"resource_manager.waiting={len(self.resource_manager.waiting)}"
+                )
                 is_fetching = False
             except Exception as e:
                 self.llm_logger.error(f"fetching request error {e} {str(traceback.format_exc())}")
@@ -1050,14 +1066,10 @@ class EngineService:
             with self._pause_cond:
                 self._pause_cond.wait_for(lambda: not self.is_paused)
             try:
-                # Wait until worker has consumed the current task batch before scheduling the next one.
-                # Unlike the old approach, we do NOT wait for engine_forward_signal here — the worker's
-                # execute_model_overlap() already handles GPU/CPU overlap internally (same as SGLang's
-                # event_loop_overlap: save last-batch output while running current-batch forward).
-                if self.engine_worker_queue.exist_tasks():
-                    time.sleep(0.001)
-                    continue
-
+                # 1. Fetch requests (async, does NOT block on worker).
+                # SGLang-aligned: fetch should proceed even while the worker is busy,
+                # so that new requests are pre-loaded into resource_manager.waiting
+                # and ready for the next schedule() call.
                 if not is_fetching:
                     # Check if the thread pool is still available to avoid submitting tasks to a shutdown thread pool.
                     try:
@@ -1069,6 +1081,14 @@ class EngineService:
                             break
                         else:
                             raise
+
+                # Wait until worker has consumed the current task batch before scheduling the next one.
+                # Unlike the old approach, we do NOT wait for engine_forward_signal here — the worker's
+                # execute_model_overlap() already handles GPU/CPU overlap internally (same as SGLang's
+                # event_loop_overlap: save last-batch output while running current-batch forward).
+                if self.engine_worker_queue.exist_tasks():
+                    time.sleep(0.001)
+                    continue
 
                 # 2. Schedule requests
                 tasks, error_tasks = self.resource_manager.schedule()

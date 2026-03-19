@@ -375,7 +375,9 @@ class ResourceManagerV1(ResourceManager):
             llm_logger.info(
                 f"Preemption triggered: {preempted_req.request_id} "
                 f"(output_len={len(preempted_req.output_token_ids)}, "
-                f"input_len={preempted_req.prompt_token_ids_len})"
+                f"input_len={preempted_req.prompt_token_ids_len}, "
+                f"running={len(self.running)}, waiting={len(self.waiting)}, "
+                f"ratio={self.current_new_token_ratio:.4f})"
             )
 
             # SGLang: after each retraction evict remaining * RETRACT_DECODE_STEPS tokens
@@ -491,11 +493,11 @@ class ResourceManagerV1(ResourceManager):
         # admission window, fail to re-enter, and trigger cascading preemptions.
         new_ratio = min(1.0, max(new_ratio, 1e-6))
 
-        llm_logger.debug(
+        llm_logger.info(
             f"Update new_token_ratio after preemption: "
             f"decode_reqs={num_decode_reqs}, decoded={total_decoded_tokens}, "
-            f"max_new={total_max_new_tokens}, ratio={new_ratio:.3f} "
-            f"(was {self.current_new_token_ratio:.3f})"
+            f"max_new={total_max_new_tokens}, ratio={new_ratio:.4f} "
+            f"(was {self.current_new_token_ratio:.4f})"
         )
 
         self.current_new_token_ratio = new_ratio
@@ -1063,17 +1065,21 @@ class ResourceManagerV1(ResourceManager):
             # mixed_with_decode_tokens (= running_bs) from rem_chunk_tokens as well.
             # Mirror this by subtracting running_decode_count from rem_chunk_tokens so that
             # decode slots already in-flight reduce the chunk budget the same way SGLang does.
-            rem_chunk_tokens = max(0, chunked_prefill_size - running_decode_count)
+            # rem_chunk_tokens = max(0, chunked_prefill_size - running_decode_count)
+            rem_chunk_tokens = chunked_prefill_size
 
             # SGLang non-mixed: decide batch type before scheduling
             # EXTEND (prefill) takes priority over DECODE, mirroring get_next_batch_to_run():
             #   1. If any request needs prefill (running chunked or new waiting) → EXTEND batch
             #   2. Otherwise → DECODE batch on running_batch
             is_extend_mode = has_running_prefill or bool(self.waiting)
-            llm_logger.debug(
-                f"SGLang batch type: {'EXTEND' if is_extend_mode else 'DECODE'} "
-                f"(running_prefill={has_running_prefill}, waiting={len(self.waiting)})"
-            )
+            if is_extend_mode:
+                llm_logger.info(
+                    f"[SCHED] batch_type=EXTEND "
+                    f"running={len(self.running)} running_prefill={has_running_prefill} "
+                    f"waiting={len(self.waiting)} running_decode={running_decode_count} "
+                    f"token_budget={token_budget} ratio={self.current_new_token_ratio:.4f}"
+                )
 
             # First, schedule the RUNNING requests.
             req_index = 0
@@ -1102,6 +1108,14 @@ class ResourceManagerV1(ResourceManager):
                     num_new_blocks_needed = 1 if (request.num_total_tokens - 1) % block_size == 0 else 0
 
                     if num_new_blocks_needed > 0:
+                        # SGLang-aligned two-phase scheduling:
+                        # Phase 1 (EXTEND): When is_extend_mode=True, skip boundary decode
+                        # so this step becomes pure prefill. Decode will be handled in Phase 2
+                        # (mixed step) or the catch-up fallback below.
+                        if is_extend_mode:
+                            num_decoding_req_nums += 1
+                            req_index += 1
+                            continue
                         if self.cache_manager.can_allocate_gpu_blocks(num_new_blocks_needed):
                             llm_logger.debug(
                                 f"schedule decoding task: {request} request.num_total_tokens {request.num_total_tokens} request.num_computed_tokens {request.num_computed_tokens}"
@@ -1280,12 +1294,22 @@ class ResourceManagerV1(ResourceManager):
                 scheduled_new_prefill_remaining_blocks: int = 0
 
                 skip_requests: list[Request] = []
+                _wait_loop_iter = 0
                 while self.waiting and token_budget > 0 and rem_chunk_tokens > 0:
+                    _wait_loop_iter += 1
                     if len(self.running) == self.max_num_seqs:
+                        llm_logger.info(
+                            f"[WAIT-BLOCK] iter={_wait_loop_iter} break: running={len(self.running)} "
+                            f"== max_num_seqs={self.max_num_seqs}"
+                        )
                         break
 
                     request = self.waiting[0]
                     if get_enough_request(request, scheduled_reqs):
+                        llm_logger.info(
+                            f"[WAIT-BLOCK] iter={_wait_loop_iter} break: get_enough_request=True "
+                            f"for {request.request_id}"
+                        )
                         break
                     if request.status == RequestStatus.WAITING:
                         result = self.waiting_async_process(request)
@@ -1306,14 +1330,23 @@ class ResourceManagerV1(ResourceManager):
                                 self.cache_manager.num_cpu_blocks > 0
                                 or self.config.cache_config.kvcache_storage_backend
                             ):
-                                if not self.cache_manager.can_allocate_gpu_blocks(
-                                    (request.need_prefill_tokens + self.config.cache_config.block_size - 1)
-                                    // self.config.cache_config.block_size
-                                ):  # to prevent block allocation for matching in hierarchical cache and cause dead lock
+                                _pc_need_blocks = (
+                                    request.need_prefill_tokens + self.config.cache_config.block_size - 1
+                                ) // self.config.cache_config.block_size
+                                if not self.cache_manager.can_allocate_gpu_blocks(_pc_need_blocks):
+                                    llm_logger.info(
+                                        f"[WAIT-BLOCK] iter={_wait_loop_iter} break: prefix_caching "
+                                        f"can't allocate {_pc_need_blocks} blocks for {request.request_id} "
+                                        f"(need_prefill_tokens={request.need_prefill_tokens})"
+                                    )
                                     break
                             success = self.get_prefix_cached_blocks(request)
                             if not success:
                                 self._free_blocks(request)
+                                llm_logger.info(
+                                    f"[WAIT-BLOCK] iter={_wait_loop_iter} break: "
+                                    f"get_prefix_cached_blocks failed for {request.request_id}"
+                                )
                                 break
 
                         if (
@@ -1347,7 +1380,24 @@ class ResourceManagerV1(ResourceManager):
                             cached_running_prefill_remaining_blocks,
                             scheduled_new_prefill_remaining_blocks,
                         )
+                        can_schedule_block_num_threshold = self._get_can_schedule_prefill_threshold_block(
+                            request, num_new_block, scheduled_new_decode_reserved_tokens,
+                            cached_running_decode_reserved,
+                            cached_running_prefill_remaining_blocks,
+                            scheduled_new_prefill_remaining_blocks,
+                        )
                         if not self.cache_manager.can_allocate_gpu_blocks(can_schedule_block_num_threshold):
+                            _fb = getattr(self.cache_manager, 'free_block_num', '?')
+                            _tb = self.total_block_number()
+                            llm_logger.info(
+                                f"[WAIT-BLOCK] iter={_wait_loop_iter} break(EXTEND): threshold={can_schedule_block_num_threshold}, "
+                                f"free={_fb}, total={_tb}, req={request.request_id}, "
+                                f"new_block={num_new_block}, new_tok={num_new_tokens}, "
+                                f"run_dec_res={cached_running_decode_reserved:.1f}, "
+                                f"new_dec_res={scheduled_new_decode_reserved_tokens:.1f}, "
+                                f"run_pf_rem={cached_running_prefill_remaining_blocks}, "
+                                f"new_pf_rem={scheduled_new_prefill_remaining_blocks}"
+                            )
                             if self.config.cache_config.enable_prefix_caching:
                                 self._free_blocks(request)
                             break
@@ -1455,10 +1505,15 @@ class ResourceManagerV1(ResourceManager):
                             scheduled_new_prefill_remaining_blocks,
                         )
                         if not self.cache_manager.can_allocate_gpu_blocks(can_schedule_block_num_threshold):
+                            _fb = getattr(self.cache_manager, 'free_block_num', '?')
+                            _tb = self.total_block_number()
+                            llm_logger.info(
+                                f"[WAIT-BLOCK] break(DECODE-MODE): threshold={can_schedule_block_num_threshold}, "
+                                f"free={_fb}, total={_tb}, req={request.request_id}"
+                            )
                             if self.config.cache_config.enable_prefix_caching:
                                 self._free_blocks(request)
                             break
-
                         # Allocate blocks to prefill
                         if not request.get("skip_allocate", False):
                             extra_gpu_block_ids = self.cache_manager.allocate_gpu_blocks(
@@ -1507,6 +1562,65 @@ class ResourceManagerV1(ResourceManager):
                     else:
                         llm_logger.info(f"Unknown request status type:{request.status}, req_id:{request.request_id}")
 
+                # Waiting loop exit summary (only log when there are still waiting requests)
+                if self.waiting and not has_scheduled_prefill and not preempted_reqs:
+                    _fb = getattr(self.cache_manager, 'free_block_num', '?')
+                    _tb = self.total_block_number()
+                    llm_logger.info(
+                        f"[WAIT-EXIT] is_extend={is_extend_mode}, waiting={len(self.waiting)}, "
+                        f"token_budget={token_budget}, rem_chunk_tokens={rem_chunk_tokens}, "
+                        f"running={len(self.running)}, scheduled_prefill={has_scheduled_prefill}, "
+                        f"free_blocks={_fb}, total_blocks={_tb}, "
+                        f"skip_requests={len(skip_requests)}"
+                    )
+
+            # SGLang-aligned catch-up fallback (Phase 2 when Phase 1 was blocked):
+            # When is_extend_mode=True but no prefill was actually scheduled (e.g., all waiting
+            # requests blocked by threshold), allow boundary decode to proceed so the engine
+            # doesn't freeze. This mirrors SGLang's behavior where get_new_batch_prefill()
+            # returns None and falls back to update_running_batch().
+            # Condition: EXTEND mode, no prefill scheduled, no preemption happened,
+            # and there are running requests that can decode.
+            if (
+                is_extend_mode
+                and not has_scheduled_prefill
+                and not preempted_reqs
+                and has_decode_requests
+            ):
+                _bs = self.config.cache_config.block_size
+                _catch_up_count = 0
+                for _r in self.running:
+                    if (
+                        _r.num_computed_tokens >= _r.need_prefill_tokens
+                        and _r.num_total_tokens > _r.need_prefill_tokens
+                        and (_r.num_total_tokens - 1) % _bs == 0
+                    ):
+                        # Mirror the running-loop decode path: update num_computed_tokens
+                        # before scheduling, so the worker sees the correct position.
+                        _r.num_computed_tokens = _r.num_total_tokens - 1
+                        if self.cache_manager.can_allocate_gpu_blocks(1):
+                            _r.block_tables.extend(
+                                self.cache_manager.allocate_gpu_blocks(1, _r.request_id)
+                            )
+                            scheduled_reqs.append(self._prepare_decode_task(_r))
+                            _catch_up_count += 1
+                        else:
+                            can = self._trigger_preempt(
+                                _r, 1, preempted_reqs, scheduled_reqs
+                            )
+                            if not can:
+                                break
+                            _r.block_tables.extend(
+                                self.cache_manager.allocate_gpu_blocks(1, _r.request_id)
+                            )
+                            scheduled_reqs.append(self._prepare_decode_task(_r))
+                            _catch_up_count += 1
+                if _catch_up_count > 0:
+                    llm_logger.info(
+                        f"[CATCH-UP] fallback decode: {_catch_up_count} requests, "
+                        f"waiting={len(self.waiting)}, running={len(self.running)}"
+                    )
+
             if scheduled_reqs:
                 llm_logger.debug(f"schedued_reqs: {scheduled_reqs}")
 
@@ -1534,6 +1648,7 @@ class ResourceManagerV1(ResourceManager):
                     queue_cnt=queue_cnt,
                     tokens_used=tokens_used,
                     token_usage=token_usage,
+                    new_token_ratio=self.current_new_token_ratio,
                 )
                 if has_decode:
                     has_prefill = len(prefill_reqs) > 0
@@ -1559,6 +1674,7 @@ class ResourceManagerV1(ResourceManager):
                         tokens_used=tokens_used,
                         token_usage=token_usage,
                         use_cudagraph=use_decode_cudagraph,
+                        new_token_ratio=self.current_new_token_ratio,
                     )
 
             #TO DO：avoid frequent calls to reset_new_token_ratio_on_idle
@@ -1589,7 +1705,7 @@ class ResourceManagerV1(ResourceManager):
                     self.current_new_token_ratio - self.new_token_ratio_decay,
                     self.min_new_token_ratio
                 )
-                llm_logger.debug(f"Decayed new_token_ratio to {self.current_new_token_ratio:.3f}")
+                llm_logger.info(f"Decayed new_token_ratio to {self.current_new_token_ratio:.4f}")
 
             self.update_metrics()
 

@@ -40,7 +40,7 @@ def test_log_prefill_batch_logs_expected_message():
         types.SimpleNamespace(prefill_start_index=3, prefill_end_index=3, num_cached_tokens=1),
     ]
 
-    logger.log_prefill_batch(prefill_reqs=reqs, running_cnt=5, queue_cnt=6, tokens_used=10, token_usage=0.75)
+    logger.log_prefill_batch(prefill_reqs=reqs, running_cnt=5, queue_cnt=6, tokens_used=10, token_usage=0.75, new_token_ratio=0.45)
 
     logger._logger.info.assert_called_once()
     message = logger._logger.info.call_args[0][0]
@@ -52,6 +52,7 @@ def test_log_prefill_batch_logs_expected_message():
     assert "token usage: 0.75" in message
     assert "#running-req: 5" in message
     assert "#queue-req: 6" in message
+    assert "new_token_ratio: 0.45" in message
 
 
 def test_log_decode_batch_computes_throughput(monkeypatch):
@@ -63,7 +64,7 @@ def test_log_decode_batch_computes_throughput(monkeypatch):
 
     monkeypatch.setattr("fastdeploy.engine.sched.scheduler_metrics_logger.time.perf_counter", lambda: 3.0)
 
-    logger.log_decode_batch(running_cnt=4, queue_cnt=7, tokens_used=8, token_usage=0.5, use_cudagraph=True)
+    logger.log_decode_batch(running_cnt=4, queue_cnt=7, tokens_used=8, token_usage=0.5, use_cudagraph=True, new_token_ratio=0.098)
 
     logger._logger.info.assert_called_once()
     message = logger._logger.info.call_args[0][0]
@@ -71,6 +72,7 @@ def test_log_decode_batch_computes_throughput(monkeypatch):
     assert "dp_rank: 1" in message
     assert "gen throughput (token/s): 5.00" in message
     assert "#queue-req: 7" in message
+    assert "new_token_ratio: 0.098" in message
     assert logger._decode_tokens_since_last == 0
     assert logger._last_decode_tic == 3.0
 

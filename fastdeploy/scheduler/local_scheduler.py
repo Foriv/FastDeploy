@@ -254,12 +254,17 @@ class LocalScheduler:
             List of Request objects ready for processing
         """
         if available_blocks <= reserved_output_blocks or batch < 1:
-            scheduler_logger.debug(
-                f"Scheduler's resource are insufficient: available_blocks={available_blocks} "
-                f"reserved_output_blocks={reserved_output_blocks} batch={batch} "
-                f"max_num_batched_tokens={max_num_batched_tokens}"
+            scheduler_logger.info(
+                f"[GET_REQS] early return: available_blocks={available_blocks} "
+                f"reserved_output_blocks={reserved_output_blocks} batch={batch}"
             )
             return []
+
+        scheduler_logger.info(
+            f"[GET_REQS] start: batch={batch}, available_blocks={available_blocks}, "
+            f"ids_total={len(self.ids)}, read_cursor={self.ids_read_cursor}, "
+            f"pending={len(self.ids) - self.ids_read_cursor}"
+        )
 
         with self.requests_not_empty:
             batch_ids = self.requests_not_empty.wait_for(
@@ -267,26 +272,26 @@ class LocalScheduler:
                 self.wait_request_timeout,
             )
 
+            scheduler_logger.info(
+                f"[GET_REQS] wait_for returned: batch_ids={len(batch_ids)}, "
+                f"pending={len(self.ids) - self.ids_read_cursor}"
+            )
+
             requests: List[Request] = []
             required_total_blocks = 0
-            current_prefill_tokens = 0
             for request_id in batch_ids:
                 request = self.requests[request_id]
                 required_input_blocks = self.calc_required_blocks(request.prompt_tokens_ids_len, block_size)
-                current_prefill_tokens += request.prompt_tokens_ids_len
                 required_total_blocks += required_input_blocks + reserved_output_blocks
                 if required_total_blocks > available_blocks:
                     break
 
-                if not envs.FD_ENABLE_MAX_PREFILL:
-                    if self.enable_chunked_prefill:
-                        # SGLang-aligned: use token budget (chunked_prefill_size) instead of a
-                        # hard request count limit, allowing multiple new requests per round.
-                        if current_prefill_tokens > self.chunked_prefill_size and len(requests) > 0:
-                            break
-                    else:
-                        if current_prefill_tokens > max_num_batched_tokens and len(requests) > 0:
-                            break
+                # SGLang-aligned: batching is controlled at schedule() time via
+                # rem_chunk_tokens / token_budget / available_blocks.
+                # Do NOT limit the number of requests pulled per fetch call —
+                # pulling more requests into resource_manager.waiting allows
+                # schedule() to see a fuller picture and better interleave
+                # chunked prefill across multiple requests.
                 requests.append(request.raw)
 
             self.ids_read_cursor += len(requests)
