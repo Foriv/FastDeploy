@@ -1116,6 +1116,16 @@ class ResourceManagerV1(ResourceManager):
                             num_decoding_req_nums += 1
                             req_index += 1
                             continue
+                        # Anti-spinning: skip if blocks already allocated for this boundary.
+                        # Without this guard, schedule() re-dispatches the same boundary decode
+                        # multiple times between GPU forward steps (worker picks up task from
+                        # queue -> queue empty -> schedule() called again -> same boundary still
+                        # matches -> duplicate dispatch + duplicate decay).
+                        _required_blocks = (request.num_total_tokens + block_size - 1) // block_size
+                        if len(request.block_tables) >= _required_blocks:
+                            num_decoding_req_nums += 1
+                            req_index += 1
+                            continue
                         if self.cache_manager.can_allocate_gpu_blocks(num_new_blocks_needed):
                             llm_logger.debug(
                                 f"schedule decoding task: {request} request.num_total_tokens {request.num_total_tokens} request.num_computed_tokens {request.num_computed_tokens}"
@@ -1588,33 +1598,46 @@ class ResourceManagerV1(ResourceManager):
                 and has_decode_requests
             ):
                 _bs = self.config.cache_config.block_size
-                _catch_up_count = 0
+
+                # Step 1: Collect all boundary decode requests that need a new block.
+                # Separating collection from allocation avoids modifying self.running
+                # while iterating and prevents a request from being both preempted
+                # and decoded in the same schedule() call.
+                boundary_reqs = []
                 for _r in self.running:
                     if (
                         _r.num_computed_tokens >= _r.need_prefill_tokens
                         and _r.num_total_tokens > _r.need_prefill_tokens
                         and (_r.num_total_tokens - 1) % _bs == 0
                     ):
-                        # Mirror the running-loop decode path: update num_computed_tokens
-                        # before scheduling, so the worker sees the correct position.
-                        _r.num_computed_tokens = _r.num_total_tokens - 1
-                        if self.cache_manager.can_allocate_gpu_blocks(1):
+                        # Anti-spinning: skip if blocks already allocated for this boundary.
+                        _req_blocks = (_r.num_total_tokens + _bs - 1) // _bs
+                        if len(_r.block_tables) >= _req_blocks:
+                            continue
+                        boundary_reqs.append(_r)
+
+                _catch_up_count = 0
+                if boundary_reqs:
+                    # Step 2: Batch-level block check. If not enough blocks, trigger
+                    # preemption but do NOT allocate in this call — let the worker
+                    # process the preempt task first, then next schedule() will retry.
+                    if not self.cache_manager.can_allocate_gpu_blocks(len(boundary_reqs)):
+                        self._trigger_preempt(
+                            boundary_reqs[0],
+                            len(boundary_reqs),
+                            preempted_reqs,
+                            scheduled_reqs,
+                        )
+                    else:
+                        # Step 3: All blocks available — allocate and schedule together.
+                        for _r in boundary_reqs:
+                            _r.num_computed_tokens = _r.num_total_tokens - 1
                             _r.block_tables.extend(
                                 self.cache_manager.allocate_gpu_blocks(1, _r.request_id)
                             )
                             scheduled_reqs.append(self._prepare_decode_task(_r))
                             _catch_up_count += 1
-                        else:
-                            can = self._trigger_preempt(
-                                _r, 1, preempted_reqs, scheduled_reqs
-                            )
-                            if not can:
-                                break
-                            _r.block_tables.extend(
-                                self.cache_manager.allocate_gpu_blocks(1, _r.request_id)
-                            )
-                            scheduled_reqs.append(self._prepare_decode_task(_r))
-                            _catch_up_count += 1
+
                 if _catch_up_count > 0:
                     llm_logger.info(
                         f"[CATCH-UP] fallback decode: {_catch_up_count} requests, "
